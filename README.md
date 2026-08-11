@@ -7,18 +7,19 @@ per-node message buffers and flushes them downward lazily.
 use be_tree::{BTreeMessage, Hlc, MemTree, Tree, store::MemStore};
 use std::sync::Arc;
 
-# async fn ex() -> Result<(), be_tree::TreeError> {
-let tree = MemTree::new(Arc::new(MemStore::new()));
-let empty = tree.empty_root().await?;
-
-let root = tree.tree_put(empty, vec![
-    BTreeMessage::upsert(b"key".to_vec(), b"value".to_vec(), Hlc { wall_ms: 1, logical: 0 }),
-]).await?;
-
-assert_eq!(tree.tree_get(root, b"key").await?, Some(b"value".to_vec()));
-// `empty` is still a valid snapshot — writes never mutate.
-assert_eq!(tree.tree_get(empty, b"key").await?, None);
-# Ok(()) }
+async fn ex() -> Result<(), be_tree::TreeError> {
+    let tree = MemTree::new(Arc::new(MemStore::new()));
+    let empty = tree.empty_root().await?;
+    
+    let root = tree.tree_put(empty, vec![
+        BTreeMessage::upsert(b"key".to_vec(), b"value".to_vec(), Hlc { wall_ms: 1, logical: 0 }),
+    ]).await?;
+    
+    assert_eq!(tree.tree_get(root, b"key").await?, Some(b"value".to_vec()));
+    // `empty` is still a valid snapshot — writes never mutate.
+    assert_eq!(tree.tree_get(empty, b"key").await?, None);
+    Ok(())
+}
 ```
 
 ## Why these three properties compound
