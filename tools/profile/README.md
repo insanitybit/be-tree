@@ -4,7 +4,7 @@ Wall-clock benchmarks answer whether a change is faster on one machine. These pr
 how many instructions, simulated cache misses, branch mispredictions, allocations, and requested bytes
 the same deterministic operation consumes.
 
-Run the allocation profile natively:
+Run the allocation profile natively (three deterministic repeats by default; set `PROFILE_REPEATS` to change it):
 
 ```console
 $ tools/profile/allocations.sh
@@ -24,6 +24,9 @@ the decoded-node cache is warmed before the operation is measured.
 The same binary covers `scan-tombstone` and `scan-stream-tombstone`, which scan a range containing 2,000
 persisted tombstones, plus `apply-WIDTH-(repeated|distinct|delete)` for small, medium, and commit-sized
 mutation batches. `tools/profile/allocations.sh` runs the complete deterministic set.
+It also runs chained `cow-low` and `cow-high` rewrites and reports newly stored object count, newly
+stored bytes, and the fraction of node objects shared between successive roots alongside allocator
+traffic.
 
 Run Cachegrind in the repository's Linux container (Docker or a compatible runtime is required):
 

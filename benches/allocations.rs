@@ -74,7 +74,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: allocations <get-many|\
         get-many-WIDTH-(sorted|random)-(hits|misses|mixed)|scan|scan-stream|\
-        scan-tombstone|scan-stream-tombstone|apply|apply-WIDTH-(repeated|distinct|delete)|hash|decode> [iterations]"
+        scan-tombstone|scan-stream-tombstone|apply|apply-WIDTH-(repeated|distinct|delete)|\
+        cow-low|cow-high|hash|decode> [iterations]"
     );
     std::process::exit(2);
 }
@@ -100,9 +101,11 @@ fn main() {
         "scan-tombstone" | "scan-stream-tombstone"
     );
     let is_apply = scenario == "apply" || scenario.starts_with("apply-");
+    let is_cow = matches!(scenario.as_str(), "cow-low" | "cow-high");
     let fixture = (is_get_many
         || is_tombstone_scan
         || is_apply
+        || is_cow
         || matches!(scenario.as_str(), "scan" | "scan-stream"))
     .then(|| {
         if is_tombstone_scan {
@@ -148,6 +151,11 @@ fn main() {
             fixture.as_ref().unwrap(),
             iterations,
             &shape[6..],
+        )),
+        "cow-low" | "cow-high" => runtime.block_on(support::cow_fixture(
+            fixture.as_ref().unwrap(),
+            scenario == "cow-high",
+            iterations,
         )),
         "hash" => support::hash(hash_bytes.as_deref().unwrap(), iterations),
         "decode" => {

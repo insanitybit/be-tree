@@ -248,6 +248,20 @@ and cold point-read pack misses against the simulated block fabric. This closes 
 consumer correctness gate; the profile's `MemStore` COW rows remain compute/allocation evidence, not
 remote-store latency evidence.
 
+The native COW allocation rows now report storage and sharing counters as well as allocator traffic.
+Across three repeats, 25 chained single-key rewrites on the 10,000-key fixture had the following
+medians:
+
+| Shape | New objects | New bytes | Root-node sharing | Allocations | Allocated bytes |
+|---|---:|---:|---:|---:|---:|
+| `cow-low` | 25 | 1,638,400 | 0.941176 | 2,286 | 10.74 MiB |
+| `cow-high` | 25 | 1,638,400 | 0.941176 | 2,245 | 10.75 MiB |
+
+The current three-repeat Cachegrind rows are `1,094,553` instructions / `4,005` D1 misses /
+`748` branch mispredicts for low overlap and `1,094,389` / `4,044` / `736` for high overlap.
+These are intentionally small single-key rewrites; the Stratum tests cover the larger one-commit
+staged batch and simulated block fabric.
+
 ## Update (single-key descent fast path, 2026-08-13)
 
 The grouped frontier is now bypassed for a one-key `get_many`. Scalar descent still uses the same

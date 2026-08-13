@@ -9,7 +9,8 @@ profile=$(find target/release/deps -maxdepth 1 -type f -name 'allocations-*' -pe
 test -n "$profile"
 
 mkdir -p target/profile
-{
+for repeat in $(seq 1 "${PROFILE_REPEATS:-3}"); do
+    echo "repeat=$repeat"
     "$profile" get-many 100
     "$profile" get-many-1-sorted-hits 100
     "$profile" get-many-16-sorted-hits 100
@@ -28,6 +29,8 @@ mkdir -p target/profile
     "$profile" apply-1024-distinct 10
     "$profile" apply-256-repeated 10
     "$profile" apply-256-delete 10
+    "$profile" cow-low 25
+    "$profile" cow-high 25
     "$profile" hash 1000
     "$profile" decode 1000
-} | tee target/profile/allocations.txt
+done | tee target/profile/allocations.txt

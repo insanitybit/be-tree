@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::hint::black_box;
 use std::sync::Arc;
 
 use be_tree::codec::{self, NodeView};
-use be_tree::{BeTree, BlockId, Format, MemStore, Mutation, VersionStamp};
+use be_tree::{BeTree, BlockId, Format, MemStore, Mutation, ObjectKind, VersionStamp};
 use bytes::Bytes;
 
 pub const KEYS: usize = 10_000;
@@ -10,6 +11,7 @@ pub const WIDTH: usize = 256;
 
 pub struct Fixture {
     pub tree: BeTree<MemStore>,
+    pub store: Arc<MemStore>,
     pub root: BlockId,
     pub keys: Vec<Bytes>,
 }
@@ -41,7 +43,12 @@ pub async fn fixture_with_prefix(prefix: &str) -> Fixture {
             .await
             .expect("build profiling fixture");
     }
-    Fixture { tree, root, keys }
+    Fixture {
+        tree,
+        store,
+        root,
+        keys,
+    }
 }
 
 #[allow(dead_code)]
@@ -355,6 +362,10 @@ pub async fn apply_named(fixture: &Fixture, iterations: usize, name: &str) -> u6
 #[allow(dead_code)]
 pub async fn cow_fixture(fixture: &Fixture, overlap: bool, iterations: usize) -> u64 {
     let mut root = fixture.root;
+    let initial_ids: HashSet<_> = fixture.store.ids().into_iter().collect();
+    let mut old_nodes = reachable_nodes(fixture, root).await;
+    let mut shared_nodes = 0usize;
+    let mut resulting_nodes = 0usize;
     for i in 0..iterations {
         let key = if overlap {
             fixture.keys[(i * 977) % fixture.keys.len()].clone()
@@ -373,8 +384,53 @@ pub async fn cow_fixture(fixture: &Fixture, overlap: bool, iterations: usize) ->
             )
             .await
             .expect("profile COW apply");
+        let new_nodes = reachable_nodes(fixture, root).await;
+        shared_nodes += old_nodes.intersection(&new_nodes).count();
+        resulting_nodes += new_nodes.len();
+        old_nodes = new_nodes;
     }
+    let final_ids: HashSet<_> = fixture.store.ids().into_iter().collect();
+    let new_objects: Vec<_> = final_ids.difference(&initial_ids).copied().collect();
+    let bytes_written: usize = new_objects
+        .iter()
+        .filter_map(|id| fixture.store.raw(*id))
+        .map(|bytes| bytes.len())
+        .sum();
+    let sharing_rate = if resulting_nodes == 0 {
+        0.0
+    } else {
+        shared_nodes as f64 / resulting_nodes as f64
+    };
+    println!(
+        "cow_metrics overlap={} iterations={} new_objects={} bytes_written={} root_node_sharing_rate={sharing_rate:.6}",
+        if overlap { "high" } else { "low" },
+        iterations,
+        new_objects.len(),
+        bytes_written,
+    );
     black_box(root.0[0] as u64)
+}
+
+async fn reachable_nodes(fixture: &Fixture, root: BlockId) -> HashSet<BlockId> {
+    let mut seen = HashSet::from([root]);
+    let mut frontier = vec![root];
+    while !frontier.is_empty() {
+        let mut next = Vec::new();
+        for id in frontier {
+            for (kind, child) in fixture
+                .tree
+                .references(id)
+                .await
+                .expect("profile references")
+            {
+                if matches!(kind, ObjectKind::Node) && seen.insert(child) {
+                    next.push(child);
+                }
+            }
+        }
+        frontier = next;
+    }
+    seen
 }
 
 pub fn hash_bytes() -> Vec<u8> {
