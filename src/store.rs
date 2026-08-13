@@ -1,12 +1,17 @@
-//! The node-store PORT: the four operations a Bε-tree needs from whatever holds its nodes.
+//! The node-store PORT: what a buffered tree needs from whatever holds its objects.
 //!
-//! The tree is content-addressed — a node's identity IS the hash of its bytes — so it needs no
-//! allocation, no free list, and no mutation. That reduces its storage requirement to "give me bytes
-//! for this hash" and "here are some bytes, tell me their hash", which is why this port is four methods
-//! rather than a filesystem.
+//! Two contract changes make the boundary honest:
 //!
-//! Implement it over anything: an in-memory map (see [`MemStore`]), a local directory, or a packing
-//! layer that coalesces `put_batch` into a few large writes. The tree does not care, and cannot tell.
+//! - **Retrieval is bounded before decode.** Every read carries the caller's `max_object_bytes`, and a
+//!   batched read carries the aggregate `max_total_bytes` left in the operation's
+//!   [`WorkBudget`](crate::WorkBudget). A
+//!   store must not allocate or return more. No unverified header field ever sizes a read.
+//! - **The tree addresses its own writes.** It computes each [`BlockId`] locally and submits
+//!   *addressed* objects, so a store can neither assign nor reinterpret identity — and must reject an
+//!   id/bytes mismatch.
+//!
+//! A batched read returns exactly one result per requested id, in input order. The tree rejects a
+//! cardinality mismatch *before* associating any bytes with any id.
 
 use std::future::Future;
 
@@ -14,56 +19,53 @@ use bytes::Bytes;
 
 use crate::{AccessHint, BlockId, TreeError};
 
-/// One node staged for a batched write. Newtype rather than a bare `Bytes` so a store implementation
-/// can attach its own per-node metadata (a retention horizon, a placement hint) without changing this
-/// signature.
-#[derive(Debug, Clone)]
-pub struct StagedNode(pub Bytes);
+/// One addressed object staged for a batched write: the id the tree computed, and its exact bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressedObject {
+    pub id: BlockId,
+    pub bytes: Bytes,
+}
 
-/// Where a Bε-tree's nodes live. Content-addressed: `put` returns the hash, and `get(hash)` must return
-/// the same bytes forever — so an implementation may cache without invalidation, and two trees that
-/// share a subtree share its blocks.
+/// Where a tree's objects live. Content-addressed: `get(id)` must return the same bytes forever, so an
+/// implementation may cache without invalidation, and two trees that share a subtree share its objects.
 pub trait NodeStore: Send + Sync + 'static {
-    /// The host's write-class vocabulary, forwarded verbatim and never interpreted by the tree. A host
-    /// with one storage tier uses `()`; a host with a durability ladder passes its own enum.
+    /// The host's write-class vocabulary, forwarded verbatim and never interpreted by the tree.
     type Class: Copy + Default + Send + Sync + 'static;
 
-    /// Fetch one node by content hash.
+    /// Fetch one object. The store must not return more than `max_object_bytes`.
     fn get(
         &self,
         id: BlockId,
         hint: AccessHint,
+        max_object_bytes: usize,
     ) -> impl Future<Output = Result<Bytes, TreeError>> + Send;
 
-    /// Fetch many nodes as ONE dependent round trip. This is the method that decides read cost: a tree
-    /// descent is O(depth) *waves* only if the frontier at each level is fetched together, so an
-    /// implementation should issue these concurrently rather than serially.
+    /// Fetch many objects as ONE dependent round trip — the method that decides read cost, since a
+    /// descent is O(depth) *waves* only if each level's frontier is fetched together.
+    ///
+    /// Returns exactly `ids.len()` results in input order. The total returned bytes must not exceed
+    /// `max_total_bytes`, and no single object may exceed `max_object_bytes`.
     fn get_many(
         &self,
         ids: &[BlockId],
         hint: AccessHint,
+        max_object_bytes: usize,
+        max_total_bytes: u64,
     ) -> impl Future<Output = Vec<Result<Bytes, TreeError>>> + Send;
 
-    /// Store one node; returns its content hash.
-    fn put(
-        &self,
-        bytes: Bytes,
-        class: Self::Class,
-    ) -> impl Future<Output = Result<BlockId, TreeError>> + Send;
-
-    /// Store a whole write walk's new nodes at once. A tree rewrite touches every node on one
-    /// root→leaf path, so batching turns O(depth) round trips into one — the difference between a
-    /// usable and an unusable tree whenever a request carries real latency.
+    /// Make every supplied object durable, or fail. The store must reject an id/bytes mismatch.
+    ///
+    /// It MAY leave a prefix durable on failure: unreferenced content-addressed objects are harmless,
+    /// and the tree publishes no new root unless the whole batch succeeded. Duplicate ids are
+    /// idempotent only when their bytes are identical.
     fn put_batch(
         &self,
-        nodes: Vec<StagedNode>,
+        objects: Vec<AddressedObject>,
         class: Self::Class,
-    ) -> impl Future<Output = Result<Vec<BlockId>, TreeError>> + Send;
+    ) -> impl Future<Output = Result<(), TreeError>> + Send;
 }
 
 /// An in-memory [`NodeStore`] — the reference implementation, and the one the tests run against.
-/// Content-addressed storage is a map from hash to bytes, so this is genuinely all it takes; anything
-/// more elaborate (packing, tiering, caching) is an optimisation over the same four methods.
 #[derive(Debug, Default)]
 pub struct MemStore {
     blocks: std::sync::Mutex<std::collections::HashMap<BlockId, Bytes>>,
@@ -74,8 +76,8 @@ impl MemStore {
         Self::default()
     }
 
-    /// How many distinct nodes are stored — the deduplication a content-addressed tree buys you is
-    /// visible here as "fewer blocks than writes".
+    /// How many distinct objects are stored — the deduplication content addressing buys you is visible
+    /// here as "fewer objects than writes".
     pub fn len(&self) -> usize {
         self.blocks.lock().expect("mem store").len()
     }
@@ -83,43 +85,166 @@ impl MemStore {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Raw stored bytes, bypassing the tree. Golden-vector, corruption, and shape tests need to inspect
+    /// or rewrite stored bytes directly.
+    #[doc(hidden)]
+    pub fn raw(&self, id: BlockId) -> Option<Bytes> {
+        self.blocks.lock().expect("mem store").get(&id).cloned()
+    }
+
+    /// Overwrite the bytes stored *at* `id` without re-addressing them — the only way to simulate bit
+    /// rot or a lying store, which is what verify-on-read exists to catch.
+    #[doc(hidden)]
+    pub fn corrupt(&self, id: BlockId, bytes: Bytes) {
+        self.blocks.lock().expect("mem store").insert(id, bytes);
+    }
+
+    #[doc(hidden)]
+    pub fn ids(&self) -> Vec<BlockId> {
+        self.blocks
+            .lock()
+            .expect("mem store")
+            .keys()
+            .copied()
+            .collect()
+    }
 }
 
 impl NodeStore for MemStore {
     type Class = ();
 
-    async fn get(&self, id: BlockId, _hint: AccessHint) -> Result<Bytes, TreeError> {
-        self.blocks
+    async fn get(
+        &self,
+        id: BlockId,
+        _hint: AccessHint,
+        max_object_bytes: usize,
+    ) -> Result<Bytes, TreeError> {
+        let bytes = self
+            .blocks
             .lock()
             .expect("mem store")
             .get(&id)
             .cloned()
-            .ok_or_else(|| TreeError::Store(format!("absent node {id}")))
+            .ok_or_else(|| TreeError::Store(format!("absent object {id}")))?;
+        check_size(bytes, max_object_bytes)
     }
 
-    async fn get_many(&self, ids: &[BlockId], hint: AccessHint) -> Vec<Result<Bytes, TreeError>> {
-        let mut out = Vec::with_capacity(ids.len());
-        for id in ids {
-            out.push(self.get(*id, hint).await);
-        }
-        out
-    }
-
-    async fn put(&self, bytes: Bytes, _class: ()) -> Result<BlockId, TreeError> {
-        let id = BlockId::of(&bytes);
-        self.blocks.lock().expect("mem store").insert(id, bytes);
-        Ok(id)
-    }
-
-    async fn put_batch(
+    /// Acquires the mutex ONCE and clones all requested byte strings in input order. Spawning
+    /// concurrent lookups against one mutex would add overhead and would not model a remote store's
+    /// concurrency anyway.
+    async fn get_many(
         &self,
-        nodes: Vec<StagedNode>,
-        class: Self::Class,
-    ) -> Result<Vec<BlockId>, TreeError> {
-        let mut ids = Vec::with_capacity(nodes.len());
-        for n in nodes {
-            ids.push(self.put(n.0, class).await?);
+        ids: &[BlockId],
+        _hint: AccessHint,
+        max_object_bytes: usize,
+        max_total_bytes: u64,
+    ) -> Vec<Result<Bytes, TreeError>> {
+        let guard = self.blocks.lock().expect("mem store");
+        let mut total = 0u64;
+        ids.iter()
+            .map(|id| {
+                let bytes = guard
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| TreeError::Store(format!("absent object {id}")))?;
+                let bytes = check_size(bytes, max_object_bytes)?;
+                total = total.saturating_add(bytes.len() as u64);
+                if total > max_total_bytes {
+                    return Err(TreeError::ResourceLimit {
+                        what: "bytes fetched",
+                    });
+                }
+                Ok(bytes)
+            })
+            .collect()
+    }
+
+    async fn put_batch(&self, objects: Vec<AddressedObject>, _class: ()) -> Result<(), TreeError> {
+        // Reject an id/bytes mismatch: the store is the last place that can catch a broken writer.
+        for o in &objects {
+            let actual = BlockId::of(&o.bytes);
+            if actual != o.id {
+                return Err(TreeError::HashMismatch {
+                    requested: o.id,
+                    actual,
+                });
+            }
         }
-        Ok(ids)
+        let mut guard = self.blocks.lock().expect("mem store");
+        for o in objects {
+            guard.insert(o.id, o.bytes);
+        }
+        Ok(())
+    }
+}
+
+fn check_size(bytes: Bytes, limit: usize) -> Result<Bytes, TreeError> {
+    if bytes.len() > limit {
+        return Err(TreeError::decode(
+            None,
+            crate::DecodeError::OversizeObject {
+                found: bytes.len(),
+                limit,
+            },
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn put_batch_rejects_an_id_bytes_mismatch() {
+        let s = MemStore::new();
+        let e = s
+            .put_batch(
+                vec![AddressedObject {
+                    id: BlockId([0; 32]),
+                    bytes: Bytes::from_static(b"not the preimage of zero"),
+                }],
+                (),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(e, TreeError::HashMismatch { .. }));
+        assert!(s.is_empty(), "nothing is stored when the batch is rejected");
+    }
+
+    #[tokio::test]
+    async fn get_many_preserves_input_order_and_duplicates() {
+        let s = MemStore::new();
+        let objs: Vec<AddressedObject> = [b"a".as_ref(), b"bb", b"ccc"]
+            .iter()
+            .map(|b| AddressedObject {
+                id: BlockId::of(b),
+                bytes: Bytes::from_static(b),
+            })
+            .collect();
+        s.put_batch(objs.clone(), ()).await.unwrap();
+        let ids = vec![objs[2].id, objs[0].id, objs[2].id];
+        let got = s.get_many(&ids, AccessHint::Random, 64, 1 << 20).await;
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].as_ref().unwrap(), &objs[2].bytes);
+        assert_eq!(got[1].as_ref().unwrap(), &objs[0].bytes);
+        assert_eq!(got[2].as_ref().unwrap(), &objs[2].bytes);
+    }
+
+    #[tokio::test]
+    async fn a_read_bound_is_enforced_by_the_store() {
+        let s = MemStore::new();
+        let bytes = Bytes::from_static(b"0123456789");
+        let id = BlockId::of(&bytes);
+        s.put_batch(vec![AddressedObject { id, bytes }], ())
+            .await
+            .unwrap();
+        assert!(s.get(id, AccessHint::Random, 4).await.is_err());
+        assert!(s.get(id, AccessHint::Random, 10).await.is_ok());
+        // ...and the aggregate bound too.
+        let got = s.get_many(&[id, id], AccessHint::Random, 10, 15).await;
+        assert!(got[0].is_ok());
+        assert!(matches!(got[1], Err(TreeError::ResourceLimit { .. })));
     }
 }
