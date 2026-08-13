@@ -89,6 +89,19 @@ struct ResolveScratch {
     next: Vec<(usize, BlockId, Option<u16>)>,
 }
 
+#[derive(Default)]
+struct MaterializeScratch {
+    refs: Vec<(BlockId, u32)>,
+    slots: Vec<Option<usize>>,
+}
+
+impl MaterializeScratch {
+    fn reset(&mut self) {
+        self.refs.clear();
+        self.slots.clear();
+    }
+}
+
 impl ResolveScratch {
     fn reset(&mut self, keys_len: usize) {
         self.best.clear();
@@ -289,6 +302,7 @@ pub struct BeTree<S: NodeStore> {
     metrics: Arc<Metrics>,
     resolve_scratch: Arc<Mutex<Vec<ResolveScratch>>>,
     wave_scratch: Arc<Mutex<Vec<WaveScratch>>>,
+    materialize_scratch: Arc<Mutex<Vec<MaterializeScratch>>>,
 }
 
 /// Result of an offline canonical rewrite. The old root remains valid and untouched; the new root is
@@ -396,6 +410,7 @@ impl<S: NodeStore> BeTree<S> {
             metrics: Arc::new(Metrics::default()),
             resolve_scratch: Arc::new(Mutex::new(Vec::new())),
             wave_scratch: Arc::new(Mutex::new(Vec::new())),
+            materialize_scratch: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -437,6 +452,7 @@ impl<S: NodeStore> BeTree<S> {
             metrics: self.metrics.clone(),
             resolve_scratch: self.resolve_scratch.clone(),
             wave_scratch: self.wave_scratch.clone(),
+            materialize_scratch: self.materialize_scratch.clone(),
         }
     }
 
@@ -502,7 +518,16 @@ impl<S: NodeStore> BeTree<S> {
                 .push(scratch);
             return Err(err);
         }
-        let values = match self.materialize_cached(&mut scratch.best, &mut budget).await {
+        let mut materialize = self
+            .materialize_scratch
+            .lock()
+            .expect("materialize scratch pool lock")
+            .pop()
+            .unwrap_or_default();
+        let values = match self
+            .materialize_cached_with_scratch(&mut scratch.best, &mut budget, &mut materialize)
+            .await
+        {
             Ok(values) => values,
             Err(err) => {
                 self.resolve_scratch
@@ -516,6 +541,10 @@ impl<S: NodeStore> BeTree<S> {
             .lock()
             .expect("resolve scratch pool lock")
             .push(scratch);
+        self.materialize_scratch
+            .lock()
+            .expect("materialize scratch pool lock")
+            .push(materialize);
         Ok(values)
     }
 
@@ -747,13 +776,25 @@ impl<S: NodeStore> BeTree<S> {
         hint: AccessHint,
         budget: &mut BudgetState,
     ) -> Result<Wave, TreeError> {
+        self.load_wave_sorted(ids, false, hint, budget).await
+    }
+
+    async fn load_wave_sorted(
+        &self,
+        ids: &[BlockId],
+        ids_are_sorted: bool,
+        hint: AccessHint,
+        budget: &mut BudgetState,
+    ) -> Result<Wave, TreeError> {
         let mut scratch = self
             .wave_scratch
             .lock()
             .expect("wave scratch pool lock")
             .pop()
             .unwrap_or_default();
-        let wave = self.wave_cached(ids, hint, budget, true, &mut scratch).await?;
+        let wave = self
+            .wave_cached(ids, ids_are_sorted, hint, budget, true, &mut scratch)
+            .await?;
         self.wave_scratch
             .lock()
             .expect("wave scratch pool lock")
@@ -823,7 +864,7 @@ impl<S: NodeStore> BeTree<S> {
             .pop()
             .unwrap_or_default();
         let wave = self
-            .wave_cached(ids, hint, budget, charge_visits, &mut scratch)
+            .wave_cached(ids, false, hint, budget, charge_visits, &mut scratch)
             .await;
         self.wave_scratch
             .lock()
@@ -835,6 +876,7 @@ impl<S: NodeStore> BeTree<S> {
     async fn wave_cached(
         &self,
         ids: &[BlockId],
+        ids_are_sorted: bool,
         hint: AccessHint,
         budget: &mut BudgetState,
         charge_visits: bool,
@@ -844,8 +886,12 @@ impl<S: NodeStore> BeTree<S> {
         let out = &mut scratch.entries;
         scratch.ids.extend_from_slice(ids);
         if scratch.ids.len() > 1 {
-            scratch.ids.sort_unstable();
-            scratch.ids.dedup();
+            if ids_are_sorted {
+                scratch.ids.dedup();
+            } else {
+                scratch.ids.sort_unstable();
+                scratch.ids.dedup();
+            }
         }
         for id in &scratch.ids {
             // Object-visit budget is charged for hits too, so sharing cannot buy unbounded CPU work.
@@ -1708,17 +1754,19 @@ impl<S: NodeStore> BeTree<S> {
             if scratch.frontier.is_empty() {
                 break;
             }
-            scratch.ids.clear();
-            for &(_, id, _) in &scratch.frontier {
-                scratch.ids.push(id);
-            }
             // Every probe descends in lockstep, so one frontier is one level and one hint.
             let hint = Self::descent_hint(scratch.frontier[0].2, false);
             let sorted_frontier = scratch
                 .frontier
                 .windows(2)
                 .all(|w| w[0].1 <= w[1].1);
-            let wave = self.load_wave(&scratch.ids, hint, budget).await?;
+            scratch.ids.clear();
+            for &(_, id, _) in &scratch.frontier {
+                scratch.ids.push(id);
+            }
+            let wave = self
+                .load_wave_sorted(&scratch.ids, sorted_frontier, hint, budget)
+                .await?;
 
             // Group probes by node by sorting frontier on node id. This avoids per-group vector
             // allocations while keeping each decoded surface reused for all probes assigned to it.
@@ -1792,21 +1840,35 @@ impl<S: NodeStore> BeTree<S> {
         winners: &mut Vec<Option<Winner>>,
         budget: &mut BudgetState,
     ) -> Result<Vec<Option<Bytes>>, TreeError> {
-        let mut refs: Vec<(BlockId, u32)> = Vec::new();
-        let mut slots: Vec<Option<usize>> = Vec::with_capacity(winners.len());
+        let mut scratch = MaterializeScratch {
+            refs: Vec::new(),
+            slots: Vec::with_capacity(winners.len()),
+        };
+        self.materialize_cached_with_scratch(winners, budget, &mut scratch)
+            .await
+    }
+
+    async fn materialize_cached_with_scratch(
+        &self,
+        winners: &mut Vec<Option<Winner>>,
+        budget: &mut BudgetState,
+        scratch: &mut MaterializeScratch,
+    ) -> Result<Vec<Option<Bytes>>, TreeError> {
+        scratch.reset();
+        // Keep capacity across calls while avoiding per-call allocations.
         for w in winners.iter() {
             match w.as_ref().map(|w| &w.op) {
                 Some(WinnerOp::External { id, len }) => {
-                    slots.push(Some(refs.len()));
-                    refs.push((*id, *len));
+                    scratch.slots.push(Some(scratch.refs.len()));
+                    scratch.refs.push((*id, *len));
                 }
-                _ => slots.push(None),
+                _ => scratch.slots.push(None),
             }
         }
-        let values = self.load_values(&refs, budget).await?;
+        let values = self.load_values(&scratch.refs, budget).await?;
         let out = winners
             .iter()
-            .zip(slots)
+            .zip(scratch.slots.iter())
             .map(|(w, slot)| match w.as_ref().map(|w| &w.op) {
                 Some(WinnerOp::Inline(v)) => Some(v.clone()),
                 Some(WinnerOp::External { .. }) => Some(values[slot.expect("recorded")].clone()),

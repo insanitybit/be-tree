@@ -88,6 +88,32 @@ Compared with the prior scratch pass, this pass does not change allocation total
 read workload, but it reduced read-side `resolve_many` timing and made it more stable when frontier IDs are
 already sorted.
 
+## Update (materialize scratch pass, 2026-08-13)
+
+I pooled the per-read `materialize` scratch allocations (`refs`, `slots`) and routed `get_many` through it.
+
+### Read path (`get-many 512`, 256 keys per batch)
+
+| Function | Calls | Avg | Total | % of run |
+|---|---|---|---|---|
+| `tree::get_many` | 513 | 32.16 µs | 16.50 ms | 66.38% |
+| `tree::resolve_many` | 513 | 29.49 µs | 15.13 ms | 60.87% |
+| `tree::wave` | 1026 | 2.35 µs | 2.42 ms | 9.77% |
+
+### Native allocation (`get-many 100`, with profiling allocator)
+
+| Scenario | Allocations | Reallocations | Allocated bytes | Peak live bytes | Live bytes |
+|---|---|---|---|---|---|
+| get-many | 460 | 200 | 995,464 | 12,360 | 72 |
+| scan | 816 | 492 | 16,106,482 | 1,276,373 | 1000 |
+| scan-stream | 814 | 480 | 11,944,946 | 227,798 | 1000 |
+| apply | 6,319 | 400 | 9,052,398 | 6,759,154 | 6,744,520 |
+| hash | 0 | 0 | 0 | 0 | 0 |
+| decode | 2,001 | 0 | 176,024 | 200 | 24 |
+
+This pass materially reduced `get-many` allocations (`560` -> `460` calls, `1,405,064` -> `995,464` bytes) while
+keeping the same deterministic workload shape. The measured timing remained near prior baselines in this run.
+
 ### Read path (`get-many 512`, 256 keys per batch)
 
 Timing (fixture setup — the `apply` rows — excluded from interpretation):
