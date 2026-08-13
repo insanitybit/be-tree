@@ -95,6 +95,26 @@ async fn cold_prefix_scans_batch_too() {
     }
 }
 
+/// A wave may contain both decoded-cache hits and store misses. The returned entries must remain
+/// sorted by content id so binary lookup cannot silently skip a node when the hit precedes a miss.
+#[tokio::test]
+async fn mixed_cached_and_fetched_nodes_preserve_batch_results() {
+    let mem = Arc::new(MemStore::new());
+    let build = BeTree::with_format(mem.clone(), Format::tiny());
+    let keys = KeyShape::Ascending.keys(4_000, 1);
+    let (root, _model) = harness::build(&build, &keys, 256, 8).await.unwrap();
+    let refs: Vec<&[u8]> = keys.iter().take(512).map(Bytes::as_ref).collect();
+    let expected = build.get_many(root, &refs).await.unwrap();
+
+    let cold = BeTree::with_format(mem, Format::tiny());
+    // Warm different paths one at a time, then issue a broad batch so each dependent wave has a
+    // deterministic mixture of cache hits and misses.
+    for key in keys.iter().step_by(17).take(30) {
+        cold.get(root, key).await.unwrap();
+        assert_eq!(cold.get_many(root, &refs).await.unwrap(), expected);
+    }
+}
+
 /// `diff` must NOT prefetch: its equal-subtree skip exists to avoid reading those subtrees, so batching
 /// them would fetch exactly what the skip saves. This pins the guard that keeps the two apart.
 #[tokio::test]

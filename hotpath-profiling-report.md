@@ -114,6 +114,156 @@ I pooled the per-read `materialize` scratch allocations (`refs`, `slots`) and ro
 This pass materially reduced `get-many` allocations (`560` -> `460` calls, `1,405,064` -> `995,464` bytes) while
 keeping the same deterministic workload shape. The measured timing remained near prior baselines in this run.
 
+## Update (wave-entry capacity recycling, 2026-08-13)
+
+`wave_cached` returns its sorted entries to the caller for binary-search lookup. Previously the entries
+vector was moved into `Wave` and an empty `WaveScratch` was immediately pooled, so every subsequent
+wave lost the vector capacity. The sorted-read caller now returns that capacity to the wave scratch pool
+after processing each dependent level.
+
+The deterministic 10,000-key, 24-byte inline-value fixture was run for 100 warm iterations per shape:
+
+| Shape | Allocations before | Allocations after | Reallocations before | Reallocations after | Bytes before | Bytes after |
+|---|---:|---:|---:|---:|---:|---:|
+| 256 sorted hits | 322 | 122 | 0 | 0 | 860,456 | 828,456 |
+| 256 random hits | 460 | 260 | 200 | 0 | 995,464 | 867,464 |
+| 256 sorted misses | 322 | 122 | 0 | 0 | 860,456 | 828,456 |
+| 256 random mixed | 460 | 260 | 200 | 0 | 995,464 | 867,464 |
+
+The expanded harness also covers 1, 16, 256, and 1024 keys, both orderings, and hit/miss/mixed outcomes.
+Checksums are consumed for every operation. These are allocator and compute-fixture measurements, not
+storage-throughput claims; Cachegrind remains unavailable on the current macOS host.
+
+## Update (write-matrix refresh and rejected flush experiment, 2026-08-13)
+
+The expanded native allocation harness was rerun after reverting the contiguous-range flush
+experiment. Current results for ten iterations are:
+
+| Shape | Allocations | Reallocations | Allocated bytes | Peak live bytes |
+|---|---:|---:|---:|---:|
+| `apply-1-distinct` | 632 | 40 | 797,451 | 681,390 |
+| `apply-256-distinct` | 1,634 | 1,957 | 25,827,089 | 2,551,286 |
+| `apply-256-delete` | 1,561 | 1,853 | 24,854,146 | 2,427,990 |
+
+The contiguous-range flush candidate reduced allocation counts and bytes for medium and large
+updates, but it was rejected by matched Criterion timing: the 256-key evolving-chain benchmark
+was about 8.87 ms at the baseline and 14.78 ms with the candidate. The candidate is not retained;
+allocation reduction alone does not satisfy the whole-operation gate.
+
+A `pack_leaves` capacity-estimation candidate likewise reduced `apply-256-distinct` allocation
+traffic from 25,827,089 to 22,128,385 bytes and reallocations from 1,957 to 1,750, but increased
+the matched `evolving_chain_32/256` median from 6.586 ms to 6.940 ms (+5.4%). It is reverted.
+
+## Update (container Cachegrind baseline and rejected `step1` experiment, 2026-08-13)
+
+Docker is available on this arm64 host, so the repository Cachegrind harness was run in its Linux
+container with three deterministic samples and the declared reference model (`I1=32 KiB`, `D1=32
+KiB`, `LL=8 MiB`, all 8-way/16-way as configured). The current retained implementation measured:
+
+| Workload | Instructions/op | D1 misses/op | Branch mispredicts/op |
+|---|---:|---:|---:|
+| `get-many` (256 keys, 100 iterations) | 538,472 | 3,723 | 4,225 |
+| `scan` (2 iterations) | 8,204,507 | 107,877 | 5,948 |
+| `scan-stream` (2 iterations) | 8,113,536 | 88,996 | 6,649 |
+| `apply` (25 iterations) | 950,980 | 3,647 | 499 |
+
+Cachegrind attributes warm batched-read work primarily to `Surface::probe` (26.8% of instructions,
+70.2% of branch mispredicts) and `step1` (23.9% of instructions). A narrow `step1` slice-comparison
+candidate passed the search correctness matrix, but regressed the selected-search matrix for uniform
+random keys by 36.4% at 256 entries and 23.9% at 2,048 entries; it is reverted. A branchless full-key
+lower-bound candidate improved uniform-random search, but regressed long-shared-prefix search by 92.2%
+at 256 entries and 65.0% at 2,048 entries; it is also reverted. Neither candidate satisfies the
+required mixed-shape gate.
+
+The measurements are simulator counters from the arm64 Linux container, not physical Apple cache
+counters. Raw outputs and metadata are under `target/profile/` and remain outside source control.
+
+The completed shape matrix produced these representative medians (all rows have three repeats and
+shape-matched setup subtraction):
+
+| Shape | Instructions/op | D1 misses/op | Branch mispredicts/op |
+|---|---:|---:|---:|
+| `get-many-1-sorted-hits` | 5,867 | 26 | 15 |
+| `get-many-16-sorted-hits` | 33,869 | 24 | 214 |
+| `get-many-256-sorted-hits` | 459,270 | 1,380 | 3,012 |
+| `get-many-1024-sorted-hits` | 1,949,562 | 13,483 | 11,996 |
+| `get-many-256-random-mixed` | 381,980 | 2,749 | 3,184 |
+| `scan-2` | 54,888 | 538 | 305 |
+| `scan-32` | 86,192 | 729 | 515 |
+| `scan-256` | 256,934 | 2,442 | 217 |
+| `scan-stream-256` | 265,650 | 2,432 | 312 |
+| `apply-256-distinct` | 5,961,167 | 76,035 | 8,865 |
+| `apply-1024-distinct` | 17,405,279 | 251,518 | 30,175 |
+| `apply-256-delete` | 5,733,371 | 72,238 | 9,045 |
+
+True point `get` Cachegrind rows, using the same fixture size and 100 measured calls, were:
+
+| Shape | Instructions/op | D1 misses/op | Branch mispredicts/op |
+|---|---:|---:|---:|
+| `get-cold-short` | 5,452 | 10 | 14 |
+| `get-hot-short` | 5,522 | 10 | 19 |
+| `get-cold-long` | 6,438 | 4 | 14 |
+| `get-hot-long` | 6,672 | 43 | 13 |
+
+These rows are after the retained direct scalar `get` path. Compared with the prior `get_many`-based
+point path, native Criterion improved uniform hit/miss medians by 2.2%/15.1% and long-prefix
+hit/miss medians by 2.6%/16.4%; all four comparisons were statistically significant on the matched
+workload fixture.
+
+The full 24-row read matrix and all scan/apply rows are in `target/profile/cachegrind.tsv`; negative
+last-level deltas are below setup-subtraction noise and are not interpreted as physical cache effects.
+
+## Update (COW matrix and rejected flush candidates, 2026-08-13)
+
+The external profiling harness now includes chained content-addressed rewrite shapes for low overlap
+(`cow-low`, new keys) and high overlap (`cow-high`, existing keys). Both shapes consume and chain every
+returned root; shape-matched setup subtraction is registered in `summarize.py`. The current profile
+fixture uses `MemStore`, so these rows validate rewrite work and root chaining, but do not claim Stratum
+store throughput or report adapter-level object sharing. Those consumer measurements remain open.
+
+Two ordinary-buffer flush candidates were measured and rejected. Sorted contiguous-range extraction
+reduced `apply-256-distinct` from 1,634 to 1,216 allocations, reallocations from 1,957 to 313, and
+allocated bytes from 25.83 MiB to 15.37 MiB; `apply-256-delete` showed the same direction (1,561 to
+1,175 allocations and 24.85 MiB to 14.59 MiB). The complete-operation gate failed: evolving-chain
+width-1 latency regressed about 14%, while width-256 showed no statistically significant change.
+The buffer-reuse grouping variant likewise retained substantially more allocation traffic than the
+range candidate and was not retained. The production path remains the original deterministic grouping
+and heaviest-child policy.
+
+## Update (consumer integration gate, 2026-08-13)
+
+The real Stratum consumer was validated against the current path dependency with:
+
+```text
+CARGO_TARGET_DIR=/tmp/stratum-be-tree-integration \
+  env -u RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER= \
+  cargo test -p stratum-l1 -p stratum-l2
+```
+
+The command passed compilation, the L1 adapter tests, and the L2 tests. The exercised consumer gate
+includes `tree_put_is_cow_new_root` (old-root immutability), `one_tree_put_stages_many_nodes_into_few_puts`
+(one addressed batch for a multi-node rewrite), split/read-back and tombstone cases, deterministic
+encoding, faulted confluence, and GC reachability. The L1 node-size study also records be-tree metrics
+and cold point-read pack misses against the simulated block fabric. This closes the previously open
+consumer correctness gate; the profile's `MemStore` COW rows remain compute/allocation evidence, not
+remote-store latency evidence.
+
+## Update (single-key descent fast path, 2026-08-13)
+
+The grouped frontier is now bypassed for a one-key `get_many`. Scalar descent still uses the same
+validated `load`, head-surface probe, child-level check, work budget, and winner resolution rules, but
+does not construct frontier or wave-result state that cannot be shared by another query.
+
+With the same prepared 10,000-key fixture and 100 iterations, hotpath reported:
+
+| Shape | `get_many` average | `resolve_many_cached` average |
+|---|---:|---:|
+| 1 sorted hit | 4.16 µs | 2.04 µs |
+| 256 sorted hits | 24.35 µs | 20.84 µs |
+
+These are instrumented native timings including the warmed fixture process; they are not a cross-build
+before/after claim. The allocation matrix remains the decision evidence for the wave-capacity change.
+
 ### Read path (`get-many 512`, 256 keys per batch)
 
 Timing (fixture setup — the `apply` rows — excluded from interpretation):

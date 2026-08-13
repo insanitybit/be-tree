@@ -10,6 +10,21 @@ Run the allocation profile natively:
 $ tools/profile/allocations.sh
 ```
 
+The allocation binary also accepts deterministic batched-read shapes directly:
+
+```console
+$ target/release/deps/allocations-<hash> get-many-256-sorted-hits 100
+$ target/release/deps/allocations-<hash> get-many-256-random-mixed 100
+```
+
+The shape is `get-many-WIDTH-(sorted|random)-(hits|misses|mixed)`, with widths 1, 16, 256, and 1024
+used by the read matrix. Query construction is outside the counted region; the fixture is prepared and
+the decoded-node cache is warmed before the operation is measured.
+
+The same binary covers `scan-tombstone` and `scan-stream-tombstone`, which scan a range containing 2,000
+persisted tombstones, plus `apply-WIDTH-(repeated|distinct|delete)` for small, medium, and commit-sized
+mutation batches. `tools/profile/allocations.sh` runs the complete deterministic set.
+
 Run Cachegrind in the repository's Linux container (Docker or a compatible runtime is required):
 
 ```console
@@ -45,3 +60,13 @@ mean the operation is beneath setup noise for that event; do not interpret them 
 Instruction counts are much more stable. Always pair these profiles with the native Criterion timings:
 neither a cache simulator nor an allocator counter models storage latency, scheduler contention, or the
 actual host's instruction costs.
+
+The Cachegrind command runs the complete read matrix (widths 1, 16, 256, and 1024; sorted and random;
+hits, misses, and mixed) with a shape-matched setup process for every row. It also runs bounded scans
+returning 2, 32, and 256 rows, streaming equivalents, and apply shapes for distinct, repeated, and
+delete-heavy batches, plus true point `get` rows for cold/hot caches and short/long common prefixes.
+It also runs chained `cow-low` and `cow-high` rewrite shapes; these consume each returned root and
+represent low overlap with new keys versus high overlap with existing keys. They use `MemStore`, so
+adapter-level object-sharing and bytes-written claims still require the Stratum consumer harness.
+`cachegrind.tsv` contains one median row per shape; `cachegrind-variability.tsv` contains the
+min/median/max across the three deterministic repeats.

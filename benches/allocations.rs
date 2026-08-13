@@ -71,13 +71,20 @@ fn reset() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: allocations <get-many|scan|scan-stream|apply|hash|decode> [iterations]");
+    eprintln!(
+        "usage: allocations <get-many|\
+        get-many-WIDTH-(sorted|random)-(hits|misses|mixed)|scan|scan-stream|\
+        scan-tombstone|scan-stream-tombstone|apply|apply-WIDTH-(repeated|distinct|delete)|hash|decode> [iterations]"
+    );
     std::process::exit(2);
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let scenario = args.next().unwrap_or_else(|| usage());
+    let Some(scenario) = args.next() else {
+        // `cargo test --all-targets` invokes harness-free benches without CLI arguments.
+        return;
+    };
     let iterations: usize = args
         .next()
         .map(|arg| arg.parse().unwrap_or_else(|_| usage()))
@@ -87,15 +94,30 @@ fn main() {
     }
 
     let runtime = support::runtime();
-    let fixture = matches!(
+    let is_get_many = scenario == "get-many" || scenario.starts_with("get-many-");
+    let is_tombstone_scan = matches!(
         scenario.as_str(),
-        "get-many" | "scan" | "scan-stream" | "apply"
-    )
-    .then(|| runtime.block_on(support::fixture()));
+        "scan-tombstone" | "scan-stream-tombstone"
+    );
+    let is_apply = scenario == "apply" || scenario.starts_with("apply-");
+    let fixture = (is_get_many
+        || is_tombstone_scan
+        || is_apply
+        || matches!(scenario.as_str(), "scan" | "scan-stream"))
+    .then(|| {
+        if is_tombstone_scan {
+            runtime.block_on(support::tombstone_fixture())
+        } else {
+            runtime.block_on(support::fixture())
+        }
+    });
+    let named_queries = scenario
+        .strip_prefix("get-many-")
+        .map(|name| support::get_many_queries(fixture.as_ref().unwrap(), name));
     let hash_bytes = (scenario == "hash").then(support::hash_bytes);
     let encoded_node = (scenario == "decode").then(support::encoded_node);
     if let Some(fixture) = &fixture
-        && scenario == "get-many"
+        && is_get_many
     {
         runtime.block_on(support::warm(fixture));
     }
@@ -104,11 +126,29 @@ fn main() {
     ENABLED.store(true, Relaxed);
     let checksum = match scenario.as_str() {
         "get-many" => runtime.block_on(support::get_many(fixture.as_ref().unwrap(), iterations)),
+        shape if shape.starts_with("get-many-") => runtime.block_on(support::get_many_prepared(
+            fixture.as_ref().unwrap(),
+            named_queries.as_ref().unwrap(),
+            iterations,
+        )),
         "scan" => runtime.block_on(support::scan(fixture.as_ref().unwrap(), iterations)),
         "scan-stream" => {
             runtime.block_on(support::scan_stream(fixture.as_ref().unwrap(), iterations))
         }
+        "scan-tombstone" => runtime.block_on(support::scan_tombstones(
+            fixture.as_ref().unwrap(),
+            iterations,
+        )),
+        "scan-stream-tombstone" => runtime.block_on(support::scan_stream_tombstones(
+            fixture.as_ref().unwrap(),
+            iterations,
+        )),
         "apply" => runtime.block_on(support::apply(fixture.as_ref().unwrap(), iterations)),
+        shape if shape.starts_with("apply-") => runtime.block_on(support::apply_named(
+            fixture.as_ref().unwrap(),
+            iterations,
+            &shape[6..],
+        )),
         "hash" => support::hash(hash_bytes.as_deref().unwrap(), iterations),
         "decode" => {
             let (format, bytes) = encoded_node.as_ref().unwrap();

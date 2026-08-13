@@ -11,9 +11,23 @@ test -n "$profile"
 mkdir -p target/profile
 {
     "$profile" get-many 100
+    "$profile" get-many-1-sorted-hits 100
+    "$profile" get-many-16-sorted-hits 100
+    "$profile" get-many-256-sorted-hits 100
+    "$profile" get-many-1024-sorted-hits 100
+    "$profile" get-many-256-random-hits 100
+    "$profile" get-many-256-sorted-misses 100
+    "$profile" get-many-256-random-mixed 100
     "$profile" scan 2
     "$profile" scan-stream 2
+    "$profile" scan-tombstone 2
+    "$profile" scan-stream-tombstone 2
     "$profile" apply 100
+    "$profile" apply-1-distinct 10
+    "$profile" apply-256-distinct 10
+    "$profile" apply-1024-distinct 10
+    "$profile" apply-256-repeated 10
+    "$profile" apply-256-delete 10
     "$profile" hash 1000
     "$profile" decode 1000
 } | tee target/profile/allocations.txt

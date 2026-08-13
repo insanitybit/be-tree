@@ -17,7 +17,28 @@ RUNS = {
     "apply": 25,
     "hash": 1000,
     "decode": 1000,
+    "get-cold-short": 100,
+    "get-cold-long": 100,
+    "get-hot-short": 100,
+    "get-hot-long": 100,
+    "scan-2": 2,
+    "scan-32": 2,
+    "scan-256": 2,
+    "scan-stream-2": 2,
+    "scan-stream-32": 2,
+    "scan-stream-256": 2,
+    "apply-1-distinct": 10,
+    "apply-256-distinct": 10,
+    "apply-1024-distinct": 10,
+    "apply-256-repeated": 10,
+    "apply-256-delete": 10,
+    "cow-low": 25,
+    "cow-high": 25,
 }
+for width in (1, 16, 256, 1024):
+    for order in ("sorted", "random"):
+        for outcome in ("hits", "misses", "mixed"):
+            RUNS[f"get-many-{width}-{order}-{outcome}"] = 100
 
 
 def read(path: Path) -> dict[str, int]:
@@ -47,6 +68,17 @@ baseline_names = {
     "hash": "setup-hash",
     "decode": "setup-decode",
 }
+for scenario in RUNS:
+    if scenario.startswith("get-"):
+        baseline_names[scenario] = f"setup-{scenario}"
+    elif scenario.startswith("get-many-"):
+        baseline_names[scenario] = f"setup-{scenario}"
+    elif scenario not in ("scan", "scan-stream", "apply") and (
+        scenario.startswith("scan-")
+        or scenario.startswith("apply-")
+        or scenario.startswith("cow-")
+    ):
+        baseline_names[scenario] = f"setup-{scenario}"
 rows = []
 variability = []
 for scenario, iterations in RUNS.items():

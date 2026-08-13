@@ -8,7 +8,12 @@ mod support;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: profile <setup|setup-get-many|setup-hash|setup-decode|get-many|scan|scan-stream|apply|hash|decode> [iterations]"
+        "usage: profile <setup|setup-get-many|setup-hash|setup-decode|get-many|\
+         get-many-WIDTH-(sorted|random)-(hits|misses|mixed)|scan|scan-stream|\
+         scan-2|scan-32|scan-256|scan-stream-2|scan-stream-32|scan-stream-256|\
+         get-cold-short|get-cold-long|get-hot-short|get-hot-long|\
+         scan-tombstone|scan-stream-tombstone|apply|apply-WIDTH-(repeated|distinct|delete)|\
+         cow-low|cow-high|setup-cow-low|setup-cow-high|hash|decode> [iterations]"
     );
     std::process::exit(2);
 }
@@ -16,7 +21,10 @@ fn usage() -> ! {
 #[cfg_attr(feature = "hotpath", hotpath::main)]
 fn main() {
     let mut args = std::env::args().skip(1);
-    let scenario = args.next().unwrap_or_else(|| usage());
+    let Some(scenario) = args.next() else {
+        // `cargo test --all-targets` invokes harness-free benches without CLI arguments.
+        return;
+    };
     let iterations: usize = args
         .next()
         .map(|arg| arg.parse().unwrap_or_else(|_| usage()))
@@ -35,6 +43,44 @@ fn main() {
         "decode" => {
             let (format, bytes) = support::encoded_node();
             support::decode(&format, &bytes, iterations)
+        }
+        shape
+            if matches!(
+                shape,
+                "setup-get-cold-short"
+                    | "setup-get-cold-long"
+                    | "setup-get-hot-short"
+                    | "setup-get-hot-long"
+            ) =>
+        {
+            let long_prefix = shape.ends_with("long");
+            let warm_cache = shape.contains("hot");
+            let runtime = support::runtime();
+            runtime.block_on(support::point_fixture(long_prefix, warm_cache))
+        }
+        shape
+            if matches!(
+                shape,
+                "get-cold-short" | "get-cold-long" | "get-hot-short" | "get-hot-long"
+            ) =>
+        {
+            let long_prefix = shape.ends_with("long");
+            let warm_cache = shape.contains("hot");
+            let runtime = support::runtime();
+            runtime.block_on(async {
+                let fixture = if long_prefix {
+                    support::fixture_with_prefix(
+                        "profile/long-common-prefix/with-many-shared-bytes/",
+                    )
+                    .await
+                } else {
+                    support::fixture().await
+                };
+                if warm_cache {
+                    support::warm(&fixture).await;
+                }
+                support::point_get(&fixture, iterations).await
+            })
         }
         "setup" | "setup-get-many" | "get-many" | "scan" | "scan-stream" | "apply" => {
             let runtime = support::runtime();
@@ -55,6 +101,74 @@ fn main() {
                     "apply" => support::apply(&fixture, iterations).await,
                     _ => unreachable!(),
                 }
+            })
+        }
+        shape if shape.starts_with("setup-get-many-") => {
+            let runtime = support::runtime();
+            runtime.block_on(async {
+                let fixture = support::fixture().await;
+                support::warm(&fixture).await;
+                let queries = support::get_many_queries(&fixture, &shape[15..]);
+                std::hint::black_box(queries.len() as u64)
+            })
+        }
+        shape if shape.starts_with("get-many-") => {
+            let runtime = support::runtime();
+            runtime.block_on(async {
+                let fixture = support::fixture().await;
+                support::warm(&fixture).await;
+                let queries = support::get_many_queries(&fixture, &shape[9..]);
+                support::get_many_prepared(&fixture, &queries, iterations).await
+            })
+        }
+        "scan-tombstone" | "scan-stream-tombstone" => {
+            let runtime = support::runtime();
+            runtime.block_on(async {
+                let fixture = support::tombstone_fixture().await;
+                if scenario == "scan-tombstone" {
+                    support::scan_tombstones(&fixture, iterations).await
+                } else {
+                    support::scan_stream_tombstones(&fixture, iterations).await
+                }
+            })
+        }
+        "setup-cow-low" | "setup-cow-high" | "cow-low" | "cow-high" => {
+            let runtime = support::runtime();
+            runtime.block_on(async {
+                let fixture = support::fixture().await;
+                let overlap = scenario.ends_with("high");
+                if scenario.starts_with("setup-") {
+                    support::cow_fixture(&fixture, overlap, 1).await
+                } else {
+                    support::cow_fixture(&fixture, overlap, iterations).await
+                }
+            })
+        }
+        shape if shape == "scan-2" || shape == "scan-32" || shape == "scan-256" => {
+            let rows = shape[5..].parse().expect("scan row count");
+            let runtime = support::runtime();
+            runtime.block_on(async {
+                let fixture = support::fixture().await;
+                support::scan_rows(&fixture, rows, iterations).await
+            })
+        }
+        shape
+            if shape == "scan-stream-2"
+                || shape == "scan-stream-32"
+                || shape == "scan-stream-256" =>
+        {
+            let rows = shape[12..].parse().expect("scan row count");
+            let runtime = support::runtime();
+            runtime.block_on(async {
+                let fixture = support::fixture().await;
+                support::scan_stream_rows(&fixture, rows, iterations).await
+            })
+        }
+        shape if shape.starts_with("apply-") => {
+            let runtime = support::runtime();
+            runtime.block_on(async {
+                let fixture = support::fixture().await;
+                support::apply_named(&fixture, iterations, &shape[6..]).await
             })
         }
         _ => usage(),

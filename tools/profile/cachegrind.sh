@@ -49,10 +49,38 @@ docker run --rm \
             run setup-get-many 1 "setup-get-many.$repeat.cachegrind"
             run setup-hash 1 "setup-hash.$repeat.cachegrind"
             run setup-decode 1 "setup-decode.$repeat.cachegrind"
+            for shape in get-cold-short get-cold-long get-hot-short get-hot-long; do
+                run "setup-$shape" 1 "setup-$shape.$repeat.cachegrind"
+                run "$shape" 100 "${shape}.$repeat.cachegrind"
+            done
             run get-many 100 "get-many.$repeat.cachegrind"
+            for shape in \
+                get-many-1-sorted-hits get-many-1-sorted-misses get-many-1-sorted-mixed \
+                get-many-1-random-hits get-many-1-random-misses get-many-1-random-mixed \
+                get-many-16-sorted-hits get-many-16-sorted-misses get-many-16-sorted-mixed \
+                get-many-16-random-hits get-many-16-random-misses get-many-16-random-mixed \
+                get-many-256-sorted-hits get-many-256-sorted-misses get-many-256-sorted-mixed \
+                get-many-256-random-hits get-many-256-random-misses get-many-256-random-mixed \
+                get-many-1024-sorted-hits get-many-1024-sorted-misses get-many-1024-sorted-mixed \
+                get-many-1024-random-hits get-many-1024-random-misses get-many-1024-random-mixed; do
+                run "setup-$shape" 1 "setup-$shape.$repeat.cachegrind"
+                run "$shape" 100 "${shape}.$repeat.cachegrind"
+            done
             run scan 2 "scan.$repeat.cachegrind"
             run scan-stream 2 "scan-stream.$repeat.cachegrind"
+            for shape in scan-2 scan-32 scan-256 scan-stream-2 scan-stream-32 scan-stream-256; do
+                run setup 1 "setup-$shape.$repeat.cachegrind"
+                run "$shape" 2 "${shape}.$repeat.cachegrind"
+            done
             run apply 25 "apply.$repeat.cachegrind"
+            for shape in apply-1-distinct apply-256-distinct apply-1024-distinct apply-256-repeated apply-256-delete; do
+                run setup 1 "setup-$shape.$repeat.cachegrind"
+                run "$shape" 10 "${shape}.$repeat.cachegrind"
+            done
+            for shape in cow-low cow-high; do
+                run "setup-$shape" 1 "setup-$shape.$repeat.cachegrind"
+                run "$shape" 25 "$shape.$repeat.cachegrind"
+            done
             run hash 1000 "hash.$repeat.cachegrind"
             run decode 1000 "decode.$repeat.cachegrind"
         done
