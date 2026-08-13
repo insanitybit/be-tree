@@ -37,6 +37,57 @@ with the features off every macro is a no-op and hotpath is not compiled.
 
 ## Findings
 
+## Update (scratch-buffer pass, 2026-08-13)
+
+I replaced the get-many descent allocation path with a reusable scratch-path and in-place winner materialization.
+
+### Read path (`get-many 512`, 256 keys per batch)
+
+| Function | Calls | Avg | Total | % of run | Alloc Total |
+|---|---|---|---|---|---|
+| `tree::get_many` | 513 | 59.64 µs | 30.60 ms | 63.27% | 6.1 MB |
+| `tree::wave` | 1026 | 3.41 µs | 3.50 ms | 7.24% | 9.0 MB |
+
+### Exclusive allocations (`get-many 512`)
+
+| Function | Calls | Avg | P95 | Total | % |
+|---|---|---|---|---|---|
+| `tree::get_many` | 513 | 12.2 KB | 12.1 KB | 6.1 MB | 15.77% |
+| `tree::wave` | 1026 | 8.9 KB | 11.0 KB | 9.0 MB | 23.14% |
+| `tree::apply_prepared` | 40 | 255.6 KB | 634.5 KB | 10.0 MB | 25.77% |
+
+The old `resolve_many` allocation spike is no longer exposed as its own hotpath bucket; the
+dominant read allocation moved to `tree::get_many`, now down to 6.1 MB total for the same
+512-iteration read workload (down from 40.6 MB in the earlier measurement).
+
+## Update (frontier-sorted fast-path pass, 2026-08-13)
+
+I kept wave pooling and switched wave lookups to binary search on sorted wave entries, while avoiding
+frontier sorting work on already-sorted traversals.
+
+### Read path (`get-many 512`, 256 keys per batch)
+
+| Function | Calls | Avg | Total | % of run |
+|---|---|---|---|---|
+| `tree::get_many` | 513 | 32.30 µs | 16.57 ms | 62.60% |
+| `tree::resolve_many` | 513 | 29.64 µs | 15.21 ms | 57.44% |
+| `tree::wave` | 1026 | 2.35 µs | 2.42 ms | 9.13% |
+
+### Native allocation (`get-many 100`, `scan`, `scan-stream`, `apply`, `hash`, `decode`)
+
+| Scenario | Allocations | Reallocations | Allocated bytes | Peak live bytes | Live bytes |
+|---|---|---|---|---|---|
+| get-many | 560 | 200 | 1,405,064 | 16,456 | 72 |
+| scan | 816 | 492 | 16,106,482 | 1,276,373 | 1000 |
+| scan-stream | 814 | 480 | 11,944,946 | 227,798 | 1000 |
+| apply | 6,319 | 400 | 9,052,394 | 6,759,154 | 6,744,520 |
+| hash | 0 | 0 | 0 | 0 | 0 |
+| decode | 2,001 | 0 | 176,024 | 200 | 24 |
+
+Compared with the prior scratch pass, this pass does not change allocation totals materially on this deterministic
+read workload, but it reduced read-side `resolve_many` timing and made it more stable when frontier IDs are
+already sorted.
+
 ### Read path (`get-many 512`, 256 keys per batch)
 
 Timing (fixture setup — the `apply` rows — excluded from interpretation):

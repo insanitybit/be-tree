@@ -17,7 +17,7 @@
 //! observably equal maps, and `tests/model.rs` asserts exactly that distinction.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
@@ -78,6 +78,59 @@ impl Rewrite {
         std::iter::once(self.first)
             .chain(self.following.iter().map(|(_, id)| *id))
             .collect()
+    }
+}
+
+#[derive(Default)]
+struct ResolveScratch {
+    best: Vec<Option<Winner>>,
+    frontier: Vec<(usize, BlockId, Option<u16>)>,
+    ids: Vec<BlockId>,
+    next: Vec<(usize, BlockId, Option<u16>)>,
+}
+
+impl ResolveScratch {
+    fn reset(&mut self, keys_len: usize) {
+        self.best.clear();
+        self.best.resize(keys_len, None);
+        self.frontier.clear();
+        self.ids.clear();
+        self.next.clear();
+    }
+}
+
+#[derive(Default)]
+struct Wave {
+    entries: Vec<(BlockId, Arc<NodeView>)>,
+}
+
+impl Wave {
+    fn get(&self, id: &BlockId) -> Option<&Arc<NodeView>> {
+        match self.entries.binary_search_by_key(id, |(entry_id, _)| *entry_id) {
+            Ok(idx) => Some(&self.entries[idx].1),
+            Err(_) => None,
+        }
+    }
+
+    fn into_values(self) -> impl Iterator<Item = Arc<NodeView>> {
+        self.entries.into_iter().map(|(_, view)| view)
+    }
+}
+
+#[derive(Default)]
+struct WaveScratch {
+    ids: Vec<BlockId>,
+    entries: Vec<(BlockId, Arc<NodeView>)>,
+    misses: Vec<BlockId>,
+    fetch: Vec<BlockId>,
+}
+
+impl WaveScratch {
+    fn reset(&mut self) {
+        self.ids.clear();
+        self.entries.clear();
+        self.misses.clear();
+        self.fetch.clear();
     }
 }
 
@@ -234,6 +287,8 @@ pub struct BeTree<S: NodeStore> {
     node_flights: Arc<Inflight<Arc<NodeView>>>,
     value_flights: Arc<Inflight<Bytes>>,
     metrics: Arc<Metrics>,
+    resolve_scratch: Arc<Mutex<Vec<ResolveScratch>>>,
+    wave_scratch: Arc<Mutex<Vec<WaveScratch>>>,
 }
 
 /// Result of an offline canonical rewrite. The old root remains valid and untouched; the new root is
@@ -246,16 +301,6 @@ pub struct MigrationReport {
     pub new_root: BlockId,
     pub rows: u64,
     pub apply_batches: u64,
-}
-
-fn dedupe_ids(ids: &[BlockId]) -> Vec<BlockId> {
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        if !out.contains(id) {
-            out.push(*id);
-        }
-    }
-    out
 }
 
 /// Cache sizing. Hard-coding 512 MiB of nodes and no value cache at all is not a defensible universal
@@ -349,6 +394,8 @@ impl<S: NodeStore> BeTree<S> {
             node_flights: Arc::new(Inflight::default()),
             value_flights: Arc::new(Inflight::default()),
             metrics: Arc::new(Metrics::default()),
+            resolve_scratch: Arc::new(Mutex::new(Vec::new())),
+            wave_scratch: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -388,6 +435,8 @@ impl<S: NodeStore> BeTree<S> {
             node_flights: self.node_flights.clone(),
             value_flights: self.value_flights.clone(),
             metrics: self.metrics.clone(),
+            resolve_scratch: self.resolve_scratch.clone(),
+            wave_scratch: self.wave_scratch.clone(),
         }
     }
 
@@ -440,8 +489,34 @@ impl<S: NodeStore> BeTree<S> {
         keys: &[&[u8]],
     ) -> Result<Vec<Option<Bytes>>, TreeError> {
         let mut budget = BudgetState::new(self.budget);
-        let winners = self.resolve_many(root, keys, &mut budget).await?;
-        self.materialize(winners, &mut budget).await
+        let mut scratch = self
+            .resolve_scratch
+            .lock()
+            .expect("resolve scratch pool lock")
+            .pop()
+            .unwrap_or_default();
+        if let Err(err) = self.resolve_many_cached(root, keys, &mut scratch, &mut budget).await {
+            self.resolve_scratch
+                .lock()
+                .expect("resolve scratch pool lock")
+                .push(scratch);
+            return Err(err);
+        }
+        let values = match self.materialize_cached(&mut scratch.best, &mut budget).await {
+            Ok(values) => values,
+            Err(err) => {
+                self.resolve_scratch
+                    .lock()
+                    .expect("resolve scratch pool lock")
+                    .push(scratch);
+                return Err(err);
+            }
+        };
+        self.resolve_scratch
+            .lock()
+            .expect("resolve scratch pool lock")
+            .push(scratch);
+        Ok(values)
     }
 
     /// Collect the sorted unique keys whose resolved values differ between two roots.
@@ -671,8 +746,19 @@ impl<S: NodeStore> BeTree<S> {
         ids: &[BlockId],
         hint: AccessHint,
         budget: &mut BudgetState,
-    ) -> Result<foldhash::HashMap<BlockId, Arc<NodeView>>, TreeError> {
-        self.wave(ids, hint, budget, true).await
+    ) -> Result<Wave, TreeError> {
+        let mut scratch = self
+            .wave_scratch
+            .lock()
+            .expect("wave scratch pool lock")
+            .pop()
+            .unwrap_or_default();
+        let wave = self.wave_cached(ids, hint, budget, true, &mut scratch).await?;
+        self.wave_scratch
+            .lock()
+            .expect("wave scratch pool lock")
+            .push(scratch);
+        Ok(wave)
     }
 
     /// Breadth-first prefetch from `roots`, one batched read per level, stopping after `width` objects.
@@ -729,44 +815,75 @@ impl<S: NodeStore> BeTree<S> {
         hint: AccessHint,
         budget: &mut BudgetState,
         charge_visits: bool,
-    ) -> Result<foldhash::HashMap<BlockId, Arc<NodeView>>, TreeError> {
-        let ids = dedupe_ids(ids);
-        let mut out: foldhash::HashMap<BlockId, Arc<NodeView>> =
-            foldhash::HashMap::with_capacity_and_hasher(ids.len(), Default::default());
-        let mut misses: Vec<BlockId> = Vec::new();
-        for id in ids {
+    ) -> Result<Wave, TreeError> {
+        let mut scratch = self
+            .wave_scratch
+            .lock()
+            .expect("wave scratch pool lock")
+            .pop()
+            .unwrap_or_default();
+        let wave = self
+            .wave_cached(ids, hint, budget, charge_visits, &mut scratch)
+            .await;
+        self.wave_scratch
+            .lock()
+            .expect("wave scratch pool lock")
+            .push(scratch);
+        wave
+    }
+
+    async fn wave_cached(
+        &self,
+        ids: &[BlockId],
+        hint: AccessHint,
+        budget: &mut BudgetState,
+        charge_visits: bool,
+        scratch: &mut WaveScratch,
+    ) -> Result<Wave, TreeError> {
+        scratch.reset();
+        let out = &mut scratch.entries;
+        scratch.ids.extend_from_slice(ids);
+        if scratch.ids.len() > 1 {
+            scratch.ids.sort_unstable();
+            scratch.ids.dedup();
+        }
+        for id in &scratch.ids {
             // Object-visit budget is charged for hits too, so sharing cannot buy unbounded CPU work.
             if charge_visits {
                 budget.visit(1)?;
             }
-            match self.cache.get(&id).await {
+            match self.cache.get(id).await {
                 Some(v) => {
                     if charge_visits {
                         self.metrics.cache_hit();
                     }
-                    out.insert(id, v);
+                    out.push((*id, v));
                 }
                 None => {
                     if charge_visits {
                         self.metrics.cache_miss();
                     }
-                    misses.push(id);
+                    scratch.misses.push(*id);
                 }
             }
         }
-        if misses.is_empty() {
-            return Ok(out);
+        if scratch.misses.is_empty() {
+            return Ok(Wave {
+                entries: std::mem::take(out),
+            });
         }
-        if misses.len() == 1 {
-            let id = misses[0];
+        if scratch.misses.len() == 1 {
+            let id = scratch.misses[0];
             let v = self.load_coalesced(id, hint, budget).await?;
-            out.insert(id, v);
-            return Ok(out);
+            out.push((id, v));
+            return Ok(Wave {
+                entries: std::mem::take(out),
+            });
         }
         // Early rejection, as for values: every node is exactly `node_bytes`, so the wave's cost is known
         // before the read.
         let declared = (self.fmt.node_bytes() as u64)
-            .checked_mul(misses.len() as u64)
+            .checked_mul(scratch.misses.len() as u64)
             .ok_or(TreeError::ResourceLimit {
                 what: "bytes fetched",
             })?;
@@ -776,11 +893,11 @@ impl<S: NodeStore> BeTree<S> {
             });
         }
         let allowance = budget.remaining_bytes();
-        let claim = self.node_flights.claim(&misses);
+        let claim = self.node_flights.claim(&scratch.misses);
         // A flight can finish and leave the map between the initial cache miss and `claim`. Recheck
         // every newly owned id so that narrow race cannot turn a completed fill into a duplicate fetch.
-        let mut fetch = Vec::new();
-        for id in claim.owned_ids().collect::<Vec<_>>() {
+        let fetch = &mut scratch.fetch;
+        for id in claim.owned_ids() {
             if let Some(view) = self.cache.get(&id).await {
                 claim.complete(id, Ok(view));
             } else {
@@ -801,7 +918,7 @@ impl<S: NodeStore> BeTree<S> {
                         expected: fetch.len(),
                     },
                 );
-                for id in &fetch {
+                for id in &*fetch {
                     claim.complete(*id, Err(error.clone()));
                 }
             } else {
@@ -825,12 +942,14 @@ impl<S: NodeStore> BeTree<S> {
                 }
             }
         }
-        for id in misses {
+        for id in scratch.misses.drain(..) {
             let v = claim.wait(id).await?;
             budget.spend_bytes(v.bytes().len() as u64)?;
-            out.insert(id, v);
+            out.push((id, v));
         }
-        Ok(out)
+        Ok(Wave {
+            entries: std::mem::take(out),
+        })
     }
 
     /// One batched wave for out-of-line winners. Each envelope must agree with the
@@ -1563,60 +1682,76 @@ impl<S: NodeStore> BeTree<S> {
         keys: &[&[u8]],
         budget: &mut BudgetState,
     ) -> Result<Vec<Option<Winner>>, TreeError> {
-        let mut best: Vec<Option<Winner>> = vec![None; keys.len()];
+        let mut scratch = ResolveScratch::default();
+        self.resolve_many_cached(root, keys, &mut scratch, budget)
+            .await?;
+        Ok(scratch.best)
+    }
+
+    async fn resolve_many_cached(
+        &self,
+        root: BlockId,
+        keys: &[&[u8]],
+        scratch: &mut ResolveScratch,
+        budget: &mut BudgetState,
+    ) -> Result<(), TreeError> {
+        scratch.reset(keys.len());
         if keys.is_empty() {
-            return Ok(best);
+            return Ok(());
         }
         // (probe index, node id, the level its parent claimed)
-        let mut frontier: Vec<(usize, BlockId, Option<u16>)> =
-            (0..keys.len()).map(|i| (i, root, None)).collect();
+        scratch
+            .frontier
+            .extend((0..keys.len()).map(|i| (i, root, None)));
 
         for _ in 0..=u32::from(self.fmt.max_tree_level()) {
-            if frontier.is_empty() {
+            if scratch.frontier.is_empty() {
                 break;
             }
-            let ids: Vec<BlockId> = frontier.iter().map(|(_, id, _)| *id).collect();
+            scratch.ids.clear();
+            for &(_, id, _) in &scratch.frontier {
+                scratch.ids.push(id);
+            }
             // Every probe descends in lockstep, so one frontier is one level and one hint.
-            let hint = Self::descent_hint(frontier[0].2, false);
-            let wave = self.load_wave(&ids, hint, budget).await?;
+            let hint = Self::descent_hint(scratch.frontier[0].2, false);
+            let sorted_frontier = scratch
+                .frontier
+                .windows(2)
+                .all(|w| w[0].1 <= w[1].1);
+            let wave = self.load_wave(&scratch.ids, hint, budget).await?;
 
-            // Group probes by node so one decoded surface serves them all.
-            let mut by_node: Vec<(BlockId, Vec<usize>)> = Vec::new();
-            for (p, id, expect) in &frontier {
-                let v = wave.get(id).expect("loaded in this wave");
-                // Traversal rejects an edge unless the child's level is exactly one below its parent.
-                if let Some(expect) = expect
-                    && v.tree_level() != *expect
-                {
-                    {
+            // Group probes by node by sorting frontier on node id. This avoids per-group vector
+            // allocations while keeping each decoded surface reused for all probes assigned to it.
+            if !sorted_frontier {
+                scratch.frontier.sort_unstable_by_key(|(_, id, _)| *id);
+            }
+            scratch.next.clear();
+            let mut i = 0usize;
+            while i < scratch.frontier.len() {
+                let id = scratch.frontier[i].1;
+                let v = wave.get(&id).expect("loaded");
+                let surface = v.entry_surface();
+                let pivot_surface = (!v.is_leaf()).then(|| v.pivot_surface());
+                let mut j = i;
+                while j < scratch.frontier.len() && scratch.frontier[j].1 == id {
+                    let (p, _, expect) = scratch.frontier[j];
+                    // Traversal rejects an edge unless the child's level is exactly one below its parent.
+                    if let Some(expect) = expect && v.tree_level() != expect {
                         return Err(TreeError::decode(
-                            Some(*id),
+                            Some(id),
                             DecodeError::ChildLevel {
                                 child: v.tree_level(),
                                 parent: expect + 1,
                             },
                         ));
                     }
-                }
-                match by_node.iter_mut().find(|entry| entry.0 == *id) {
-                    Some((_, probes)) => probes.push(*p),
-                    None => by_node.push((*id, vec![*p])),
-                }
-            }
-
-            let mut next: Vec<(usize, BlockId, Option<u16>)> = Vec::new();
-            for (id, probes) in by_node {
-                let v = wave.get(&id).expect("loaded");
-                let surface = v.entry_surface();
-                let pivot_surface = (!v.is_leaf()).then(|| v.pivot_surface());
-                for p in probes {
                     let key = keys[p];
                     let f = surface.probe(key);
                     self.metrics.probe(f.cost);
                     if f.exact {
                         let w = v.winner(f.index);
-                        if best[p].as_ref().is_none_or(|b| w > *b) {
-                            best[p] = Some(w);
+                        if scratch.best[p].as_ref().is_none_or(|b| w > *b) {
+                            scratch.best[p] = Some(w);
                         }
                     } else if !v.is_leaf() {
                         // Priced for a future routing summary: a probe that touched a buffer and found
@@ -1625,18 +1760,20 @@ impl<S: NodeStore> BeTree<S> {
                     }
                     if let Some(ps) = &pivot_surface {
                         let child = ps.probe(key).upper_bound();
-                        next.push((p, v.child(child), Some(v.tree_level() - 1)));
+                        scratch.next.push((p, v.child(child), Some(v.tree_level() - 1)));
                     }
+                    j += 1;
                 }
+                i = j;
             }
-            frontier = next;
+            std::mem::swap(&mut scratch.next, &mut scratch.frontier);
         }
-        if !frontier.is_empty() {
+        if !scratch.frontier.is_empty() {
             return Err(TreeError::ResourceLimit {
                 what: "tree depth above max_tree_level",
             });
         }
-        Ok(best)
+        Ok(())
     }
 
     /// Turn resolved winners into values, fetching every out-of-line winner in ONE batched wave.
@@ -1646,9 +1783,18 @@ impl<S: NodeStore> BeTree<S> {
         winners: Vec<Option<Winner>>,
         budget: &mut BudgetState,
     ) -> Result<Vec<Option<Bytes>>, TreeError> {
+        let mut winners = winners;
+        self.materialize_cached(&mut winners, budget).await
+    }
+
+    async fn materialize_cached(
+        &self,
+        winners: &mut Vec<Option<Winner>>,
+        budget: &mut BudgetState,
+    ) -> Result<Vec<Option<Bytes>>, TreeError> {
         let mut refs: Vec<(BlockId, u32)> = Vec::new();
         let mut slots: Vec<Option<usize>> = Vec::with_capacity(winners.len());
-        for w in &winners {
+        for w in winners.iter() {
             match w.as_ref().map(|w| &w.op) {
                 Some(WinnerOp::External { id, len }) => {
                     slots.push(Some(refs.len()));
@@ -1658,15 +1804,19 @@ impl<S: NodeStore> BeTree<S> {
             }
         }
         let values = self.load_values(&refs, budget).await?;
-        Ok(winners
-            .into_iter()
+        let out = winners
+            .iter()
             .zip(slots)
-            .map(|(w, slot)| match w.map(|w| w.op) {
-                Some(WinnerOp::Inline(v)) => Some(v),
+            .map(|(w, slot)| match w.as_ref().map(|w| &w.op) {
+                Some(WinnerOp::Inline(v)) => Some(v.clone()),
                 Some(WinnerOp::External { .. }) => Some(values[slot.expect("recorded")].clone()),
                 _ => None,
             })
-            .collect())
+            .collect();
+        for winner in winners.iter_mut() {
+            *winner = None;
+        }
+        Ok(out)
     }
 
     /// Every `BlockId` reachable from `node`: child nodes AND out-of-line values, so a GC cannot miss a
