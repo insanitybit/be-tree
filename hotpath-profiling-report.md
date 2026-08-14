@@ -180,7 +180,9 @@ The measurements are simulator counters from the arm64 Linux container, not phys
 counters. Raw outputs and metadata are under `target/profile/` and remain outside source control.
 
 The completed shape matrix produced these representative medians (all rows have three repeats and
-shape-matched setup subtraction):
+shape-matched setup subtraction). *Superseded: these rows were captured from an intermediate
+uncommitted working tree; the committed-revision re-measurement in the 2026-08-14 update below is
+authoritative.*
 
 | Shape | Instructions/op | D1 misses/op | Branch mispredicts/op |
 |---|---:|---:|---:|
@@ -197,7 +199,9 @@ shape-matched setup subtraction):
 | `apply-1024-distinct` | 17,405,279 | 251,518 | 30,175 |
 | `apply-256-delete` | 5,733,371 | 72,238 | 9,045 |
 
-True point `get` Cachegrind rows, using the same fixture size and 100 measured calls, were:
+True point `get` Cachegrind rows, using the same fixture size and 100 measured calls, were
+(*superseded — see the 2026-08-14 update: these "cold" rows reread one key, so calls 2–100 were
+cache hits and cold ≈ hot below*):
 
 | Shape | Instructions/op | D1 misses/op | Branch mispredicts/op |
 |---|---:|---:|---:|
@@ -250,8 +254,10 @@ consumer correctness gate; the profile's `MemStore` COW rows remain compute/allo
 remote-store latency evidence.
 
 The native COW allocation rows now report storage and sharing counters as well as allocator traffic.
-Across three repeats, 25 chained single-key rewrites on the 10,000-key fixture had the following
-medians:
+*Superseded: these single-key rewrites were absorbed by the root buffer, so cow-low and cow-high were
+structurally identical one-node rewrites and could not measure the overlap axis. The 2026-08-14
+update below replaces them with commit-sized batches.* Across three repeats, 25 chained single-key
+rewrites on the 10,000-key fixture had the following medians:
 
 | Shape | New objects | New bytes | Root-node sharing | Allocations | Allocated bytes |
 |---|---:|---:|---:|---:|---:|
@@ -334,6 +340,82 @@ into a pooled `BytesMut`) would cut write-path allocation by ~28% in this worklo
 
 Timing on the write side: `apply` ≈ 183–188 µs per batch, with `apply_prepared`
 (rewrite + flush) at ~94% of it and `normalize` ~6%.
+
+## Update (review-fix pass and committed-revision re-measurement, 2026-08-14)
+
+A review of the measured plan found three harness defects and one library defect; all are fixed in
+commit `2fc2330` and the full matrix below was re-captured from that committed revision. The
+container digest `5a2be23b…` reproduces from the clean checkout with
+`LC_ALL=C find src benches Cargo.toml Cargo.lock -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum`,
+so every row in `target/profile/` is now attributable to one commit. `metadata.txt` additionally
+records the fixture dimensions and `commands.txt` records every profiled invocation.
+
+The fixes that change what the numbers mean:
+
+- **Budget parity (library).** Work-budget visits are charged once per external-value reference on
+  every read path. Scalar `get` had been double-charging and batched `get_many` undercharging
+  (per unique value object). Pinned by a scalar/batched parity test; the Stratum consumer gate
+  (stratum-l1 + stratum-l2, 135 tests) passes against the fixed revision.
+- **COW shapes are commit-sized.** `cow-low`/`cow-high` now apply 25 chained 256-mutation prebuilt
+  batches with keys spread across the whole keyspace. The previous single-key commits were absorbed
+  by the root buffer, making both shapes identical one-node rewrites. Metrics walks now run outside
+  the measured region and the setup twin builds the same batches and applies none.
+- **Cold point-get is cold.** Cold rows read 16 distinct strided keys (at most the fixture's leaf
+  count) instead of rereading one warmed key 100 times. Cold and hot rows are now distinct, as the
+  measurement protocol requires; cold rows are not comparable to the superseded table above.
+- **New required shapes.** Tombstone-dense scans and the mixed upsert+tombstone apply batch joined
+  the Cachegrind matrix.
+
+Representative medians (three repeats, shape-matched setup subtraction; full 24-row read matrix in
+`target/profile/cachegrind.tsv`):
+
+| Shape | Instructions/op | D1 misses/op | Branch mispredicts/op |
+|---|---:|---:|---:|
+| `get-many-1-sorted-hits` | 6,075 | 22 | 11 |
+| `get-many-16-sorted-hits` | 33,993 | 38 | 215 |
+| `get-many-256-sorted-hits` | 457,169 | 1,390 | 3,255 |
+| `get-many-1024-sorted-hits` | 1,942,474 | 13,518 | 13,008 |
+| `get-many-256-random-mixed` | 380,258 | 2,789 | 3,320 |
+| `get-many-256-sorted-misses` | 172,295 | 1,002 | 798 |
+| `scan-2` | 39,211 | 358 | 300 |
+| `scan-32` | 98,391 | 1,713 | 712 |
+| `scan-256` | 274,671 | 2,914 | 482 |
+| `scan-stream-256` | 254,545 | 3,000 | 303 |
+| `scan-tombstone` | 2,690,734 | 22,061 | 3,669 |
+| `scan-stream-tombstone` | 2,671,242 | 20,470 | 3,736 |
+| `apply-256-distinct` | 5,982,400 | 76,262 | 8,844 |
+| `apply-256-delete` | 5,748,454 | 72,574 | 9,073 |
+| `apply-256-mixed` | 5,727,987 | 73,195 | 10,668 |
+| `apply-1024-distinct` | 17,483,313 | 251,963 | 30,144 |
+
+Point `get`, with genuinely cold leaf loads (16 distinct strided keys) versus a warmed reread:
+
+| Shape | Instructions/op | D1 misses/op | Branch mispredicts/op |
+|---|---:|---:|---:|
+| `get-cold-short` | 6,110 | 46 | 40 |
+| `get-cold-long` | 9,686 | 488 | 70 |
+| `get-hot-short` | 5,003 | 2 | 18 |
+| `get-hot-long` | 6,759 | 12 | 19 |
+
+COW rewrite shapes, per 256-mutation commit: `cow-low` 7,978,298 instructions / 79,946 D1 misses /
+11,125 branch mispredicts; `cow-high` 6,172,605 / 78,441 / 9,277. The overlap axis now
+discriminates. Native storage counters across 25 commits (byte-identical over three repeats):
+
+| Shape | New objects | New bytes | Successive sharing | Final sharing with original | Allocations | Allocated bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| `cow-low` | 148 | 9,699,328 | 0.876974 | 0.000000 | 6,220 | 66,094,366 |
+| `cow-high` | 91 | 5,963,776 | 0.785882 | 0.000000 | 4,148 | 67,517,584 |
+
+At 25 commit-sized batches over this 17-node fixture every original node is eventually rewritten, so
+final sharing with the original root saturates at zero for both shapes; the discriminating metrics at
+this scale are new objects, new bytes, and commit-to-commit sharing. These remain `MemStore`
+compute/allocation rows, not adapter-level storage claims.
+
+Read-path continuity check against the superseded intermediate capture: `get-many-256-sorted-hits`
+moved 457,707 → 457,169 instructions/op and `apply-256-distinct` 5,975,792 → 5,982,400 (allocation
+totals unchanged: 122 allocations / 828,456 bytes per 100 iterations, 25.8 MB per 10 applies) — the
+budget-parity and scratch-clearing fixes are visit-accounting and retention changes, not hot-loop
+changes, and the matrix confirms no read or write regression beyond run-to-run noise.
 
 ## What transfers from the guide, what doesn't
 

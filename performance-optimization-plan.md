@@ -1,7 +1,7 @@
 # be-tree performance optimization plan
 
-Status: implementation and integration validation complete for the measured plan: accepted Phase 1 read-path experiments, including the direct scalar `get` path, are implemented; Phase 3 encoder-buffer, Phase 4 flush, and leaf-capacity experiments were rejected by whole-operation evidence; the COW shape harness and Stratum consumer gate are complete. Phase 2 representation changes and Phase 6 concurrency changes were not justified by the measured hotspots, and Phase 5's existing value-separation path was validated rather than replaced.
-Date: 2026-08-13
+Status: implementation and integration validation complete for the measured plan: accepted Phase 1 read-path experiments, including the direct scalar `get` path, are implemented; Phase 3 encoder-buffer, Phase 4 flush, and leaf-capacity experiments were rejected by whole-operation evidence; the COW shape harness and Stratum consumer gate are complete. Phase 2 representation changes and Phase 6 concurrency changes were not justified by the measured hotspots, and Phase 5's existing value-separation path was validated rather than replaced. A 2026-08-14 review pass repaired the measurement gates (commit-sized COW shapes, genuinely cold point-get rows, tombstone-scan and mixed-apply Cachegrind rows) and a budget-accounting parity defect, and re-captured the full matrix from committed revision `2fc2330`; see the profiling report's matching update.
+Date: 2026-08-13 (measurement gates re-validated 2026-08-14)
 
 The current implementation retains the existing canonical format and scan merge optimization while
 measuring the next read/write experiments. A three-sample Cachegrind baseline is now captured through
