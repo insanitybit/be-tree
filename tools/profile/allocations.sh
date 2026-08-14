@@ -29,6 +29,7 @@ for repeat in $(seq 1 "${PROFILE_REPEATS:-3}"); do
     "$profile" apply-1024-distinct 10
     "$profile" apply-256-repeated 10
     "$profile" apply-256-delete 10
+    "$profile" apply-256-mixed 10
     "$profile" cow-low 25
     "$profile" cow-high 25
     "$profile" hash 1000

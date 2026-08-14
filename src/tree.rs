@@ -520,17 +520,11 @@ impl<S: NodeStore> BeTree<S> {
             .resolve_many_cached(root, &[key], &mut budget, &mut scratch)
             .await
         {
-            self.resolve_scratch
-                .lock()
-                .expect("resolve scratch pool lock")
-                .push(scratch);
+            self.pool_resolve_scratch(scratch);
             return Err(error);
         }
         let winner = scratch.best.pop().flatten();
-        self.resolve_scratch
-            .lock()
-            .expect("resolve scratch pool lock")
-            .push(scratch);
+        self.pool_resolve_scratch(scratch);
         match winner.map(|winner| winner.op) {
             Some(WinnerOp::Inline(value)) => Ok(Some(value)),
             Some(WinnerOp::External { id, len }) => Ok(Some(
@@ -567,14 +561,8 @@ impl<S: NodeStore> BeTree<S> {
             .resolve_many_cached(root, keys, &mut budget, &mut scratch)
             .await
         {
-            self.resolve_scratch
-                .lock()
-                .expect("resolve scratch pool lock")
-                .push(scratch);
-            self.materialize_scratch
-                .lock()
-                .expect("materialize scratch pool lock")
-                .push(materialize);
+            self.pool_resolve_scratch(scratch);
+            self.pool_materialize_scratch(materialize);
             return Err(err);
         };
         let values = match self
@@ -583,26 +571,13 @@ impl<S: NodeStore> BeTree<S> {
         {
             Ok(values) => values,
             Err(err) => {
-                self.materialize_scratch
-                    .lock()
-                    .expect("materialize scratch pool lock")
-                    .push(materialize);
-                self.resolve_scratch
-                    .lock()
-                    .expect("resolve scratch pool lock")
-                    .push(scratch);
+                self.pool_materialize_scratch(materialize);
+                self.pool_resolve_scratch(scratch);
                 return Err(err);
             }
         };
-        scratch.best.clear();
-        self.resolve_scratch
-            .lock()
-            .expect("resolve scratch pool lock")
-            .push(scratch);
-        self.materialize_scratch
-            .lock()
-            .expect("materialize scratch pool lock")
-            .push(materialize);
+        self.pool_resolve_scratch(scratch);
+        self.pool_materialize_scratch(materialize);
         Ok(values)
     }
 
@@ -837,6 +812,36 @@ impl<S: NodeStore> BeTree<S> {
         self.wave(ids, hint, budget, true).await
     }
 
+    /// Return a scratch to its pool with payload-bearing fields cleared. `Vec::clear` keeps the
+    /// allocated capacity — the point of pooling — while dropping the `Arc<NodeView>` entries
+    /// promptly, so an idle tree does not pin a whole wave of decoded nodes outside cache accounting.
+    fn pool_wave_scratch(&self, mut scratch: WaveScratch) {
+        scratch.entries.clear();
+        self.wave_scratch
+            .lock()
+            .expect("wave scratch pool lock")
+            .push(scratch);
+    }
+
+    /// As [`Self::pool_wave_scratch`]: drop winner payload `Bytes` before pooling.
+    fn pool_resolve_scratch(&self, mut scratch: ResolveScratch) {
+        scratch.best.clear();
+        self.resolve_scratch
+            .lock()
+            .expect("resolve scratch pool lock")
+            .push(scratch);
+    }
+
+    /// As [`Self::pool_wave_scratch`]: drop value payload `Bytes` before pooling.
+    fn pool_materialize_scratch(&self, mut scratch: MaterializeScratch) {
+        scratch.out.clear();
+        scratch.cached.clear();
+        self.materialize_scratch
+            .lock()
+            .expect("materialize scratch pool lock")
+            .push(scratch);
+    }
+
     async fn wave_sorted_ids(
         &self,
         ids: &[BlockId],
@@ -856,10 +861,7 @@ impl<S: NodeStore> BeTree<S> {
         match wave {
             Ok(wave) => Ok((wave, scratch)),
             Err(error) => {
-                self.wave_scratch
-                    .lock()
-                    .expect("wave scratch pool lock")
-                    .push(scratch);
+                self.pool_wave_scratch(scratch);
                 Err(error)
             }
         }
@@ -929,10 +931,7 @@ impl<S: NodeStore> BeTree<S> {
         let wave = self
             .wave_cached(ids, false, hint, budget, charge_visits, &mut scratch)
             .await;
-        self.wave_scratch
-            .lock()
-            .expect("wave scratch pool lock")
-            .push(scratch);
+        self.pool_wave_scratch(scratch);
         wave
     }
 
@@ -957,6 +956,13 @@ impl<S: NodeStore> BeTree<S> {
             scratch.ids.sort_unstable();
             scratch.ids.dedup();
         } else {
+            // A caller declaring `ids_are_sorted` must also have deduplicated: this branch hands the
+            // ids to `node_flights.claim` as-is, and a duplicate would double-charge visits and claim
+            // one flight twice.
+            debug_assert!(
+                ids.windows(2).all(|w| w[0] < w[1]),
+                "sorted wave ids must be strictly ascending"
+            );
             scratch.ids.extend_from_slice(ids);
         }
         for id in &scratch.ids {
@@ -1080,6 +1086,8 @@ impl<S: NodeStore> BeTree<S> {
         }
         // Deduplicate and consult the value cache first. Passing duplicate ids straight to `get_many`
         // fetched one shared value once per reference — a value shared by N keys cost N fetches.
+        // Visits are charged here, once per REFERENCE (not per unique id): per `WorkBudget`, sharing
+        // must not turn into unbounded free CPU work. The deduplicated loader charges nothing.
         let mut unique: Vec<(BlockId, u32)> = Vec::new();
         let mut slot: Vec<usize> = Vec::with_capacity(refs.len());
         let mut index: foldhash::HashMap<BlockId, usize> = Default::default();
@@ -1116,10 +1124,11 @@ impl<S: NodeStore> BeTree<S> {
         if refs.is_empty() {
             return Ok(Vec::new());
         }
+        // Visits were already charged per reference by the caller; charging again here would bill
+        // each unique id twice.
         let mut cached: Vec<Option<Bytes>> = Vec::with_capacity(refs.len());
         let mut missing: Vec<(BlockId, u32)> = Vec::new();
         for (id, len) in refs {
-            budget.visit(1)?;
             match self.values.get(id).await {
                 Some(payload) => {
                     self.metrics.cache_hit();
@@ -1150,12 +1159,13 @@ impl<S: NodeStore> BeTree<S> {
         if scratch.refs.is_empty() {
             return Ok(());
         }
+        // Visits were already charged per reference in `materialize_cached`; `scratch.refs` holds the
+        // deduplicated ids, so charging here would price a batch by unique values instead of work.
         scratch.cached.clear();
         scratch.cached.reserve(scratch.refs.len());
         scratch.missing.clear();
         scratch.missing.reserve(scratch.refs.len());
         for (id, len) in scratch.refs.iter() {
-            budget.visit(1)?;
             match self.values.get(id).await {
                 Some(payload) => {
                     self.metrics.cache_hit();
@@ -1909,10 +1919,7 @@ impl<S: NodeStore> BeTree<S> {
                 if expect != u16::MAX && tree_level != expect {
                     let parent = expect + 1;
                     wave_scratch.entries = wave.entries;
-                    self.wave_scratch
-                        .lock()
-                        .expect("wave scratch pool lock")
-                        .push(wave_scratch);
+                    self.pool_wave_scratch(wave_scratch);
                     return Err(TreeError::decode(
                         Some(id),
                         DecodeError::ChildLevel {
@@ -1930,10 +1937,7 @@ impl<S: NodeStore> BeTree<S> {
                     None
                 } else {
                     let Some(level) = tree_level.checked_sub(1) else {
-                        self.wave_scratch
-                            .lock()
-                            .expect("wave scratch pool lock")
-                            .push(wave_scratch);
+                        self.pool_wave_scratch(wave_scratch);
                         return Err(TreeError::decode(
                             Some(id),
                             DecodeError::ChildLevel {
@@ -1982,10 +1986,7 @@ impl<S: NodeStore> BeTree<S> {
             // level is processed. Recycle that vector's capacity along with the remaining wave
             // scratch before the next dependent level.
             wave_scratch.entries = wave.entries;
-            self.wave_scratch
-                .lock()
-                .expect("wave scratch pool lock")
-                .push(wave_scratch);
+            self.pool_wave_scratch(wave_scratch);
             std::mem::swap(frontier, &mut scratch.next);
             frontier_is_sorted = next_sorted;
         }
@@ -2080,6 +2081,10 @@ impl<S: NodeStore> BeTree<S> {
         for (slot, w) in winners.iter().enumerate() {
             match w.as_ref().map(|w| &w.op) {
                 Some(WinnerOp::External { id, len }) => {
+                    // One visit per external REFERENCE, charged before dedup: `WorkBudget` prices the
+                    // work a batch demands, and N keys sharing one value are still N resolutions.
+                    // Matches the scalar `get` path through `load_values`.
+                    budget.visit(1)?;
                     let ref_slot = *scratch.index.entry(*id).or_insert_with(|| {
                         let index = scratch.refs.len();
                         scratch.refs.push((*id, *len));
@@ -2139,6 +2144,11 @@ impl<S: NodeStore> BeTree<S> {
 
     /// Every `BlockId` reachable from `node`: child nodes AND out-of-line values, so a GC cannot miss a
     /// value edge by parsing only child ids.
+    ///
+    /// This is the SUPPORTED graph-walk entry point for consumers: GC mark walks are built on it, and
+    /// a level-at-a-time walk filtered to [`crate::ObjectKind::Node`] derives the shape facts the old
+    /// test harness exposed (node count, leaf depth range) for asserting a workload did not
+    /// degenerate the tree.
     pub async fn references(
         &self,
         node: BlockId,

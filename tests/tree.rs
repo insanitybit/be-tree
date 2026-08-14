@@ -619,6 +619,73 @@ async fn a_work_budget_bounds_a_walk_and_returns_no_partial_result() {
     assert!(byte_starved.get_many(root, &probe).await.is_err());
 }
 
+/// Scalar `get` and a one-key `get_many` must price identical work identically, and a batch's visit
+/// cost must grow per REFERENCE for a shared external value: N keys resolving to one value object are
+/// still N resolutions, so value sharing cannot buy unbounded free CPU work under one budget.
+#[tokio::test]
+async fn visit_budget_prices_scalar_and_batched_reads_identically() {
+    let (store, t, empty) = tree().await;
+    // 64 bytes is above `Format::tiny()`'s inline threshold, so the winner is an external reference.
+    let root = t
+        .apply(empty, stamp(1), vec![up("k", &"x".repeat(64))])
+        .await
+        .unwrap();
+    assert!(
+        t.references(root)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(kind, _)| *kind == be_tree::ObjectKind::Value),
+        "fixture must produce an out-of-line value"
+    );
+
+    // Find the smallest visit budget at which each operation succeeds. Fresh tree per probe: budgets
+    // are per-operation, and visits are charged for cache hits too, so caching must not change the
+    // count.
+    let probe_tree = |budget: u64| {
+        BeTree::with_format(store.clone(), Format::tiny()).with_budget(WorkBudget {
+            max_objects: budget,
+            max_fetched_bytes: u64::MAX,
+        })
+    };
+    let mut min_get = None;
+    let mut min_one = None;
+    let mut min_dup = None;
+    for budget in 1..64u64 {
+        if min_get.is_none() && probe_tree(budget).get(root, b"k").await.is_ok() {
+            min_get = Some(budget);
+        }
+        if min_one.is_none()
+            && probe_tree(budget)
+                .get_many(root, &[b"k".as_ref()])
+                .await
+                .is_ok()
+        {
+            min_one = Some(budget);
+        }
+        if min_dup.is_none()
+            && probe_tree(budget)
+                .get_many(root, &[b"k".as_ref(), b"k".as_ref()])
+                .await
+                .is_ok()
+        {
+            min_dup = Some(budget);
+        }
+    }
+    let min_get = min_get.expect("get succeeds within 64 visits");
+    let min_one = min_one.expect("get_many succeeds within 64 visits");
+    let min_dup = min_dup.expect("duplicate get_many succeeds within 64 visits");
+    assert_eq!(
+        min_get, min_one,
+        "scalar get and one-key get_many charge equal visits"
+    );
+    assert_eq!(
+        min_dup,
+        min_one + 1,
+        "a duplicated key costs exactly its extra external-value reference"
+    );
+}
+
 /// A tree taller than `max_tree_level` cannot be built: the attempt fails and publishes nothing.
 #[tokio::test]
 #[cfg_attr(miri, ignore = "native maximum-depth root-growth fixture")]

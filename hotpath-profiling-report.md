@@ -132,7 +132,8 @@ The deterministic 10,000-key, 24-byte inline-value fixture was run for 100 warm 
 
 The expanded harness also covers 1, 16, 256, and 1024 keys, both orderings, and hit/miss/mixed outcomes.
 Checksums are consumed for every operation. These are allocator and compute-fixture measurements, not
-storage-throughput claims; Cachegrind remains unavailable on the current macOS host.
+storage-throughput claims; Cachegrind is unavailable natively on this macOS host — the Docker
+container harness introduced below now provides it.
 
 ## Update (write-matrix refresh and rejected flush experiment, 2026-08-13)
 
@@ -206,9 +207,9 @@ True point `get` Cachegrind rows, using the same fixture size and 100 measured c
 | `get-hot-long` | 6,672 | 43 | 13 |
 
 These rows are after the retained direct scalar `get` path. Compared with the prior `get_many`-based
-point path, native Criterion improved uniform hit/miss medians by 2.2%/15.1% and long-prefix
-hit/miss medians by 2.6%/16.4%; all four comparisons were statistically significant on the matched
-workload fixture.
+point path, native Criterion improved uniform hit/miss mean estimates by 2.2%/15.1% and long-prefix
+hit/miss mean estimates by 2.6%/16.4% (median estimates: 1.6%/14.3% and 2.2%/15.4%); all four 95%
+confidence intervals exclude zero on the matched workload fixture.
 
 The full 24-row read matrix and all scan/apply rows are in `target/profile/cachegrind.tsv`; negative
 last-level deltas are below setup-subtraction noise and are not interpreted as physical cache effects.

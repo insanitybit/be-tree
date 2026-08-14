@@ -84,8 +84,10 @@ profiler/cache model, checksum, and source revision or content digest.
 | COW rewrite | low and high overlap with an existing tree | new objects, bytes written, root-sharing rate |
 
 The scan matrix must include a tombstone-dense range in addition to live-value ranges. The profile
-fixtures currently do not exercise delete/remove/tombstone shapes, so tombstone behavior is an explicit
-regression surface rather than an incidental consequence of the live-key cases.
+fixtures now cover this surface: `scan-tombstone`/`scan-stream-tombstone` scan a persisted 2,000-key
+tombstone interval, and `apply-WIDTH-delete`/`apply-WIDTH-mixed` exercise delete-heavy and interleaved
+upsert+tombstone batches. Tombstone behavior remains an explicit regression surface — keep these
+shapes in every matrix rerun rather than treating them as incidental.
 
 Before Phase 0, confirm that the key/value sizes, duplicate rate, delete rate, common-prefix length,
 batch widths, and update overlap match Stratum's intended workloads. If Stratum does not yet have

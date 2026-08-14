@@ -12,7 +12,7 @@ fn usage() -> ! {
          get-many-WIDTH-(sorted|random)-(hits|misses|mixed)|scan|scan-stream|\
          scan-2|scan-32|scan-256|scan-stream-2|scan-stream-32|scan-stream-256|\
          get-cold-short|get-cold-long|get-hot-short|get-hot-long|\
-         scan-tombstone|scan-stream-tombstone|apply|apply-WIDTH-(repeated|distinct|delete)|\
+         scan-tombstone|scan-stream-tombstone|apply|apply-WIDTH-(repeated|distinct|delete|mixed)|\
          cow-low|cow-high|setup-cow-low|setup-cow-high|hash|decode> [iterations]"
     );
     std::process::exit(2);
@@ -78,8 +78,12 @@ fn main() {
                 };
                 if warm_cache {
                     support::warm(&fixture).await;
+                    // Hot: reread one warmed key, so every measured call is a cache hit.
+                    support::point_get(&fixture, iterations).await
+                } else {
+                    // Cold: distinct strided keys, so measured leaf loads stay genuine misses.
+                    support::point_get_distinct(&fixture, iterations).await
                 }
-                support::point_get(&fixture, iterations).await
             })
         }
         "setup" | "setup-get-many" | "get-many" | "scan" | "scan-stream" | "apply" => {
@@ -121,14 +125,19 @@ fn main() {
                 support::get_many_prepared(&fixture, &queries, iterations).await
             })
         }
-        "scan-tombstone" | "scan-stream-tombstone" => {
+        "scan-tombstone" | "scan-stream-tombstone" | "setup-scan-tombstone"
+        | "setup-scan-stream-tombstone" => {
             let runtime = support::runtime();
             runtime.block_on(async {
+                // The tombstone fixture includes an extra delete batch, so these shapes need their
+                // own setup twin: subtracting the plain fixture would attribute that apply to the scan.
                 let fixture = support::tombstone_fixture().await;
-                if scenario == "scan-tombstone" {
-                    support::scan_tombstones(&fixture, iterations).await
-                } else {
-                    support::scan_stream_tombstones(&fixture, iterations).await
+                match scenario.as_str() {
+                    "setup-scan-tombstone" | "setup-scan-stream-tombstone" => {
+                        fixture.root.0[0] as u64
+                    }
+                    "scan-tombstone" => support::scan_tombstones(&fixture, iterations).await,
+                    _ => support::scan_stream_tombstones(&fixture, iterations).await,
                 }
             })
         }
@@ -137,10 +146,15 @@ fn main() {
             runtime.block_on(async {
                 let fixture = support::fixture().await;
                 let overlap = scenario.ends_with("high");
+                // Both variants build the same batches; only the measured variant applies them, so
+                // the setup twin is shape-matched and the delta is exactly `iterations` commits of
+                // rewrite work. Run the setup twin with the SAME iteration count.
+                let mut batches = support::cow_batches(&fixture, overlap, iterations);
+                let mut roots = Vec::with_capacity(batches.len());
                 if scenario.starts_with("setup-") {
-                    support::cow_fixture(&fixture, overlap, 1).await
+                    std::hint::black_box(batches.len() as u64)
                 } else {
-                    support::cow_fixture(&fixture, overlap, iterations).await
+                    support::cow_apply(&fixture, &mut batches, &mut roots).await
                 }
             })
         }

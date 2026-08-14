@@ -17,8 +17,8 @@ RUNS = {
     "apply": 25,
     "hash": 1000,
     "decode": 1000,
-    "get-cold-short": 100,
-    "get-cold-long": 100,
+    "get-cold-short": 16,
+    "get-cold-long": 16,
     "get-hot-short": 100,
     "get-hot-long": 100,
     "scan-2": 2,
@@ -27,11 +27,14 @@ RUNS = {
     "scan-stream-2": 2,
     "scan-stream-32": 2,
     "scan-stream-256": 2,
+    "scan-tombstone": 2,
+    "scan-stream-tombstone": 2,
     "apply-1-distinct": 10,
     "apply-256-distinct": 10,
     "apply-1024-distinct": 10,
     "apply-256-repeated": 10,
     "apply-256-delete": 10,
+    "apply-256-mixed": 10,
     "cow-low": 25,
     "cow-high": 25,
 }
@@ -69,9 +72,9 @@ baseline_names = {
     "decode": "setup-decode",
 }
 for scenario in RUNS:
+    # `get-` covers `get-many-…` too; keep one branch so a future shape cannot silently pair with
+    # the wrong baseline.
     if scenario.startswith("get-"):
-        baseline_names[scenario] = f"setup-{scenario}"
-    elif scenario.startswith("get-many-"):
         baseline_names[scenario] = f"setup-{scenario}"
     elif scenario not in ("scan", "scan-stream", "apply") and (
         scenario.startswith("scan-")

@@ -74,7 +74,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: allocations <get-many|\
         get-many-WIDTH-(sorted|random)-(hits|misses|mixed)|scan|scan-stream|\
-        scan-tombstone|scan-stream-tombstone|apply|apply-WIDTH-(repeated|distinct|delete)|\
+        scan-tombstone|scan-stream-tombstone|apply|apply-WIDTH-(repeated|distinct|delete|mixed)|\
         cow-low|cow-high|hash|decode> [iterations]"
     );
     std::process::exit(2);
@@ -124,6 +124,22 @@ fn main() {
     {
         runtime.block_on(support::warm(fixture));
     }
+    // COW batch construction, the root log, and the initial store snapshot all sit OUTSIDE the
+    // counted region: the region below is rewrite work only, and the sharing/storage counters are
+    // collected after counting is disabled.
+    let mut cow_batches = is_cow.then(|| {
+        support::cow_batches(fixture.as_ref().unwrap(), scenario == "cow-high", iterations)
+    });
+    let mut cow_roots = is_cow.then(|| Vec::with_capacity(iterations));
+    let cow_initial_ids = is_cow.then(|| {
+        fixture
+            .as_ref()
+            .unwrap()
+            .store
+            .ids()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+    });
 
     reset();
     ENABLED.store(true, Relaxed);
@@ -152,10 +168,10 @@ fn main() {
             iterations,
             &shape[6..],
         )),
-        "cow-low" | "cow-high" => runtime.block_on(support::cow_fixture(
+        "cow-low" | "cow-high" => runtime.block_on(support::cow_apply(
             fixture.as_ref().unwrap(),
-            scenario == "cow-high",
-            iterations,
+            cow_batches.as_mut().unwrap(),
+            cow_roots.as_mut().unwrap(),
         )),
         "hash" => support::hash(hash_bytes.as_deref().unwrap(), iterations),
         "decode" => {
@@ -165,6 +181,14 @@ fn main() {
         _ => usage(),
     };
     ENABLED.store(false, Relaxed);
+    if let (Some(initial_ids), Some(roots)) = (&cow_initial_ids, &cow_roots) {
+        runtime.block_on(support::cow_metrics_line(
+            fixture.as_ref().unwrap(),
+            scenario == "cow-high",
+            initial_ids,
+            roots,
+        ));
+    }
     let baseline = BASELINE_LIVE_BYTES.load(Relaxed);
     let peak = PEAK_LIVE_BYTES.load(Relaxed).saturating_sub(baseline);
     let live = CURRENT_LIVE_BYTES.load(Relaxed) as i128 - baseline as i128;

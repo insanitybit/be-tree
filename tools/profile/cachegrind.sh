@@ -29,11 +29,15 @@ docker run --rm \
             echo "cache_model=I1:32768,8,64 D1:32768,8,64 LL:8388608,16,64"
             echo "repeats=$PROFILE_REPEATS"
             echo "source_digest=$source_digest"
+            # Fixture dimensions, from benches/profile/support.rs constants.
+            echo "fixture=keys:10000,inline_value_bytes:22,commit_width:256,store:MemStore"
         } > /profile/metadata.txt
+        : > /profile/commands.txt
         run() {
             scenario=$1
             iterations=$2
             destination=$3
+            echo "$profile $scenario $iterations > $destination" >> /profile/commands.txt
             valgrind --tool=cachegrind --branch-sim=yes \
                 --quiet \
                 --error-exitcode=99 \
@@ -49,7 +53,13 @@ docker run --rm \
             run setup-get-many 1 "setup-get-many.$repeat.cachegrind"
             run setup-hash 1 "setup-hash.$repeat.cachegrind"
             run setup-decode 1 "setup-decode.$repeat.cachegrind"
-            for shape in get-cold-short get-cold-long get-hot-short get-hot-long; do
+            # Cold shapes read 16 DISTINCT strided keys (at most the fixture leaf count), so every
+            # measured leaf load is a real miss; rereading one key 100 times would be 99% warm.
+            for shape in get-cold-short get-cold-long; do
+                run "setup-$shape" 1 "setup-$shape.$repeat.cachegrind"
+                run "$shape" 16 "${shape}.$repeat.cachegrind"
+            done
+            for shape in get-hot-short get-hot-long; do
                 run "setup-$shape" 1 "setup-$shape.$repeat.cachegrind"
                 run "$shape" 100 "${shape}.$repeat.cachegrind"
             done
@@ -72,13 +82,19 @@ docker run --rm \
                 run setup 1 "setup-$shape.$repeat.cachegrind"
                 run "$shape" 2 "${shape}.$repeat.cachegrind"
             done
+            for shape in scan-tombstone scan-stream-tombstone; do
+                run "setup-$shape" 1 "setup-$shape.$repeat.cachegrind"
+                run "$shape" 2 "${shape}.$repeat.cachegrind"
+            done
             run apply 25 "apply.$repeat.cachegrind"
-            for shape in apply-1-distinct apply-256-distinct apply-1024-distinct apply-256-repeated apply-256-delete; do
+            for shape in apply-1-distinct apply-256-distinct apply-1024-distinct apply-256-repeated apply-256-delete apply-256-mixed; do
                 run setup 1 "setup-$shape.$repeat.cachegrind"
                 run "$shape" 10 "${shape}.$repeat.cachegrind"
             done
             for shape in cow-low cow-high; do
-                run "setup-$shape" 1 "setup-$shape.$repeat.cachegrind"
+                # The setup twin builds the SAME prebuilt batches as the measured run and applies
+                # none of them, so the delta is exactly the chained commits.
+                run "setup-$shape" 25 "setup-$shape.$repeat.cachegrind"
                 run "$shape" 25 "$shape.$repeat.cachegrind"
             done
             run hash 1000 "hash.$repeat.cachegrind"
