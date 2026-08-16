@@ -5,10 +5,10 @@ mod support;
 
 use std::sync::Arc;
 
-use be_tree::format::Format;
-use be_tree::store::MemStore;
-use be_tree::tree::{CacheConfig, VerifyPolicy};
-use be_tree::{BeTree, BlockId, CapacityError, Mutation, TreeError, VersionStamp, WorkBudget};
+use cbe_tree::format::Format;
+use cbe_tree::store::MemStore;
+use cbe_tree::tree::{CacheConfig, VerifyPolicy};
+use cbe_tree::{BeTree, BlockId, CapacityError, Mutation, TreeError, VersionStamp, WorkBudget};
 use bytes::Bytes;
 use support as harness;
 
@@ -635,14 +635,14 @@ async fn visit_budget_prices_scalar_and_batched_reads_identically() {
             .await
             .unwrap()
             .iter()
-            .any(|(kind, _)| *kind == be_tree::ObjectKind::Value),
+            .any(|(kind, _)| *kind == cbe_tree::ObjectKind::Value),
         "fixture must produce an out-of-line value"
     );
 
     // Find the smallest visit budget at which each operation succeeds. Fresh tree per probe: budgets
     // are per-operation, and visits are charged for cache hits too, so caching must not change the
     // count.
-    let probe_tree = |budget: u64| {
+    let procbe_tree = |budget: u64| {
         BeTree::with_format(store.clone(), Format::tiny()).with_budget(WorkBudget {
             max_objects: budget,
             max_fetched_bytes: u64::MAX,
@@ -652,11 +652,11 @@ async fn visit_budget_prices_scalar_and_batched_reads_identically() {
     let mut min_one = None;
     let mut min_dup = None;
     for budget in 1..64u64 {
-        if min_get.is_none() && probe_tree(budget).get(root, b"k").await.is_ok() {
+        if min_get.is_none() && procbe_tree(budget).get(root, b"k").await.is_ok() {
             min_get = Some(budget);
         }
         if min_one.is_none()
-            && probe_tree(budget)
+            && procbe_tree(budget)
                 .get_many(root, &[b"k".as_ref()])
                 .await
                 .is_ok()
@@ -664,7 +664,7 @@ async fn visit_budget_prices_scalar_and_batched_reads_identically() {
             min_one = Some(budget);
         }
         if min_dup.is_none()
-            && probe_tree(budget)
+            && procbe_tree(budget)
                 .get_many(root, &[b"k".as_ref(), b"k".as_ref()])
                 .await
                 .is_ok()
@@ -690,7 +690,7 @@ async fn visit_budget_prices_scalar_and_batched_reads_identically() {
 #[tokio::test]
 #[cfg_attr(miri, ignore = "native maximum-depth root-growth fixture")]
 async fn root_growth_beyond_max_tree_level_fails_without_publication() {
-    use be_tree::format::FormatParams;
+    use cbe_tree::format::FormatParams;
     // f_max = 3, max_tree_level = 1: a tree can hold at most 3 leaves.
     let params = FormatParams {
         max_tree_level: 1,
@@ -732,8 +732,8 @@ async fn root_growth_beyond_max_tree_level_fails_without_publication() {
 #[tokio::test]
 #[cfg_attr(miri, ignore = "native access-hint tree fixture")]
 async fn the_tree_tells_the_store_what_kind_of_read_each_wave_is() {
-    use be_tree::AccessHint;
-    use be_tree::store::{AddressedObject, NodeStore};
+    use cbe_tree::AccessHint;
+    use cbe_tree::store::{AddressedObject, NodeStore};
     use std::sync::Mutex;
 
     /// Records the hint of every read it serves.
@@ -828,8 +828,8 @@ async fn the_tree_tells_the_store_what_kind_of_read_each_wave_is() {
 #[tokio::test]
 #[cfg_attr(miri, ignore = "native malformed-batch multi-node fixture")]
 async fn a_malformed_batched_read_cardinality_is_rejected_before_bytes_meet_ids() {
-    use be_tree::AccessHint;
-    use be_tree::store::{AddressedObject, NodeStore};
+    use cbe_tree::AccessHint;
+    use cbe_tree::store::{AddressedObject, NodeStore};
 
     /// A store that returns one fewer result than requested.
     struct ShortStore(Arc<MemStore>);
@@ -876,7 +876,7 @@ async fn a_malformed_batched_read_cardinality_is_rejected_before_bytes_meet_ids(
         matches!(
             e,
             TreeError::Decode {
-                reason: be_tree::DecodeError::BatchCardinality { .. },
+                reason: cbe_tree::DecodeError::BatchCardinality { .. },
                 ..
             }
         ),

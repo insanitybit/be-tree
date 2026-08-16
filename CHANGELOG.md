@@ -5,6 +5,15 @@ recorded here so a consumer's changelog is not the compiler.
 
 ## Unreleased
 
+### Breaking
+
+- **Crate renamed: `be-tree` → `cbe-tree`** (display name **cbε-tree**, content-addressed Bε-tree).
+  Two reasons: the name now says what distinguishes this tree — content addressing — from every other
+  Bε-tree, and `be-tree` was already taken on crates.io by an unrelated 2020 library, so the old name
+  was unpublishable. The import path changes from `be_tree::` to `cbe_tree::`. A consumer can keep its
+  existing paths with one dependency line:
+  `be-tree = { package = "cbe-tree", path = "../be-tree" }`.
+
 ### Fixed
 
 - Work-budget visit accounting is again charged once per external-value **reference** on every read

@@ -9,9 +9,9 @@ mod support;
 
 use std::sync::Arc;
 
-use be_tree::format::Format;
-use be_tree::store::MemStore;
-use be_tree::{BeTree, Mutation, VersionStamp};
+use cbe_tree::format::Format;
+use cbe_tree::store::MemStore;
+use cbe_tree::{BeTree, Mutation, VersionStamp};
 use bytes::Bytes;
 use support::{self as harness, KeyShape, Model, Rng};
 

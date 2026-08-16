@@ -12,11 +12,11 @@ mod support;
 
 use std::sync::Arc;
 
-use be_tree::codec::NodeView;
-use be_tree::format::{Format, NodeKind};
-use be_tree::store::MemStore;
-use be_tree::tree::VerifyPolicy;
-use be_tree::{BeTree, BlockId, DecodeError, Mutation, TreeError, VersionStamp};
+use cbe_tree::codec::NodeView;
+use cbe_tree::format::{Format, NodeKind};
+use cbe_tree::store::MemStore;
+use cbe_tree::tree::VerifyPolicy;
+use cbe_tree::{BeTree, BlockId, DecodeError, Mutation, TreeError, VersionStamp};
 use bytes::Bytes;
 use support::{self as harness, KeyShape, Rng};
 
@@ -45,7 +45,7 @@ async fn reachable_nodes(t: &BeTree<MemStore>, root: BlockId) -> Vec<BlockId> {
         }
         seen.push(id);
         for (kind, child) in t.references(id).await.unwrap() {
-            if kind == be_tree::ObjectKind::Node {
+            if kind == cbe_tree::ObjectKind::Node {
                 frontier.push(child);
             }
         }
@@ -196,7 +196,7 @@ fn arbitrary_byte_strings_are_never_accepted_unsafely() {
                 // A *plausible* node: correct magic and format id, random everything else. This is the
                 // shape that actually reaches the deep validators.
                 let mut b = vec![0u8; f.node_bytes()];
-                b[..8].copy_from_slice(&be_tree::format::NODE_MAGIC);
+                b[..8].copy_from_slice(&cbe_tree::format::NODE_MAGIC);
                 b[8..24].copy_from_slice(f.schema_id());
                 b[24] = (rng.next_u64() & 1) as u8;
                 b[48..64].copy_from_slice(f.version_domain());
@@ -239,9 +239,9 @@ fn arbitrary_byte_strings_are_never_accepted_unsafely() {
 #[cfg_attr(miri, ignore = "native exhaustive length sweep")]
 fn every_wrong_length_is_rejected_on_length_alone() {
     let f = Arc::new(fmt());
-    let good = be_tree::codec::encode_leaf(
+    let good = cbe_tree::codec::encode_leaf(
         &f,
-        &[be_tree::codec::Entry::inline(
+        &[cbe_tree::codec::Entry::inline(
             Bytes::from_static(b"k"),
             VersionStamp::from_counter(1).order_key,
             Bytes::from_static(b"v"),
@@ -293,7 +293,7 @@ async fn a_substituted_value_object_is_rejected() {
         .ids()
         .into_iter()
         .filter_map(|id| store.raw(id).map(|b| (id, b)))
-        .filter(|(_, b)| b.starts_with(&be_tree::value::VALUE_MAGIC))
+        .filter(|(_, b)| b.starts_with(&cbe_tree::value::VALUE_MAGIC))
         .collect();
     assert_eq!(
         value_objects.len(),
@@ -352,7 +352,7 @@ async fn the_two_object_domains_cannot_be_confused() {
         .find(|id| {
             store
                 .raw(*id)
-                .is_some_and(|b| b.starts_with(&be_tree::value::VALUE_MAGIC))
+                .is_some_and(|b| b.starts_with(&cbe_tree::value::VALUE_MAGIC))
         })
         .expect("a value object");
     // Replace the value object with a perfectly valid NODE.

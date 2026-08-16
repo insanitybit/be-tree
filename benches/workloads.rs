@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering::Relaxed;
 
-use be_tree::format::Format;
-use be_tree::store::{AddressedObject, MemStore, NodeStore};
-use be_tree::tree::{CacheConfig, VerifyPolicy};
-use be_tree::{AccessHint, BeTree, BlockId, Mutation, TreeError, VersionStamp};
+use cbe_tree::format::Format;
+use cbe_tree::store::{AddressedObject, MemStore, NodeStore};
+use cbe_tree::tree::{CacheConfig, VerifyPolicy};
+use cbe_tree::{AccessHint, BeTree, BlockId, Mutation, TreeError, VersionStamp};
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use support::{self as harness, CountingStore, KeyShape};

@@ -7,9 +7,9 @@ mod support;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
-use be_tree::format::Format;
-use be_tree::store::MemStore;
-use be_tree::{BeTree, Mutation, VersionStamp};
+use cbe_tree::format::Format;
+use cbe_tree::store::MemStore;
+use cbe_tree::{BeTree, Mutation, VersionStamp};
 use bytes::Bytes;
 use support::{self as harness, CountingStore, KeyShape};
 
@@ -75,7 +75,7 @@ fn stored_value_bytes(mem: &MemStore) -> usize {
     mem.ids()
         .into_iter()
         .filter_map(|id| mem.raw(id))
-        .filter(|b| b.starts_with(&be_tree::value::VALUE_MAGIC))
+        .filter(|b| b.starts_with(&cbe_tree::value::VALUE_MAGIC))
         .map(|b| b.len())
         .sum()
 }
@@ -111,7 +111,7 @@ async fn one_shared_value_is_staged_once_not_once_per_key() {
     // The precise claim: one logical value is one stored object, of one envelope plus one payload.
     assert_eq!(
         stored_value_bytes(&mem),
-        be_tree::value::ENVELOPE_BYTES + 513,
+        cbe_tree::value::ENVELOPE_BYTES + 513,
         "256 keys sharing one value must store that value exactly once"
     );
     assert!(
@@ -179,7 +179,7 @@ async fn one_shared_large_bytes_is_encoded_and_hashed_once() {
     assert_eq!(t.metrics().value_objects_encoded, 1);
     assert_eq!(
         t.metrics().value_bytes_hashed,
-        (value.len() + be_tree::value::ENVELOPE_BYTES) as u64
+        (value.len() + cbe_tree::value::ENVELOPE_BYTES) as u64
     );
 }
 
