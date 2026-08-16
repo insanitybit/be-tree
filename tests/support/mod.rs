@@ -3,7 +3,7 @@
 //!
 //! This lands *before* the codec and tree changes it measures, because a single favorable fixture would
 //! hide a structural defect. [`check`] is the shape oracle: it walks a whole tree and asserts every
-//! structural commitment the RFC makes, including the ones local decode cannot see (child range
+//! structural commitment, including the ones local decode cannot see (child range
 //! ownership, buffer path ownership, and equal leaf depth).
 //!
 //! `MemStore` timings measure *compute*. [`CountingStore`] is the separate instrument that records
@@ -200,7 +200,7 @@ impl<S: NodeStore> NodeStore for CountingStore<S> {
 
 /// The structural facts a whole-tree walk establishes. Minimum and maximum leaf depth are reported
 /// separately as a *correctness* signal: an average would hide an unbalanced spine, which is exactly the
-/// defect this RFC exists to repair.
+/// defect this oracle exists to prevent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TreeShape {
     pub nodes: usize,
@@ -427,7 +427,7 @@ pub async fn check<S: NodeStore>(tree: &BeTree<S>, root: BlockId) -> Result<Tree
     Ok(shape)
 }
 
-/// `check`, plus the equal-leaf-depth assertion the RFC's acceptance criteria name.
+/// `check`, plus the equal-leaf-depth assertion required by the tree invariants.
 pub async fn check_balanced<S: NodeStore>(
     tree: &BeTree<S>,
     root: BlockId,
@@ -591,7 +591,7 @@ impl Rng {
     }
 }
 
-/// The key-shape fixtures the RFC names. Every workload runs against all of them, because a single
+/// The key-shape fixtures used by the workload matrix. Every workload runs against all of them, because a single
 /// favorable distribution hides both the degeneration and the equal-head-range risk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyShape {

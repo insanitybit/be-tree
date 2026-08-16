@@ -223,7 +223,7 @@ last-level deltas are below setup-subtraction noise and are not interpreted as p
 The external profiling harness now includes chained content-addressed rewrite shapes for low overlap
 (`cow-low`, new keys) and high overlap (`cow-high`, existing keys). Both shapes consume and chain every
 returned root; shape-matched setup subtraction is registered in `summarize.py`. The current profile
-fixture uses `MemStore`, so these rows validate rewrite work and root chaining, but do not claim Stratum
+fixture uses `MemStore`, so these rows validate rewrite work and root chaining, but do not claim downstream
 store throughput or report adapter-level object sharing. Those consumer measurements remain open.
 
 Two ordinary-buffer flush candidates were measured and rejected. Sorted contiguous-range extraction
@@ -237,13 +237,8 @@ and heaviest-child policy.
 
 ## Update (consumer integration gate, 2026-08-13)
 
-The real Stratum consumer was validated against the current path dependency with:
-
-```text
-CARGO_TARGET_DIR=/tmp/stratum-be-tree-integration \
-  env -u RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER= \
-  cargo test -p stratum-l1 -p stratum-l2
-```
+The downstream consumer was validated against the current path dependency. Its compilation, adapter
+tests, and higher-level consumer tests passed.
 
 The command passed compilation, the L1 adapter tests, and the L2 tests. The exercised consumer gate
 includes `tree_put_is_cow_new_root` (old-root immutability), `one_tree_put_stages_many_nodes_into_few_puts`
@@ -266,7 +261,7 @@ rewrites on the 10,000-key fixture had the following medians:
 
 The current three-repeat Cachegrind rows are `1,094,553` instructions / `4,005` D1 misses /
 `748` branch mispredicts for low overlap and `1,094,389` / `4,044` / `736` for high overlap.
-These are intentionally small single-key rewrites; the Stratum tests cover the larger one-commit
+These are intentionally small single-key rewrites; the downstream consumer tests cover the larger one-commit
 staged batch and simulated block fabric.
 
 ## Update (single-key descent fast path, 2026-08-13)
@@ -354,8 +349,8 @@ The fixes that change what the numbers mean:
 
 - **Budget parity (library).** Work-budget visits are charged once per external-value reference on
   every read path. Scalar `get` had been double-charging and batched `get_many` undercharging
-  (per unique value object). Pinned by a scalar/batched parity test; the Stratum consumer gate
-  (stratum-l1 + stratum-l2, 135 tests) passes against the fixed revision.
+  (per unique value object). Pinned by a scalar/batched parity test; the downstream consumer gate
+  passes against the fixed revision.
 - **COW shapes are commit-sized.** `cow-low`/`cow-high` now apply 25 chained 256-mutation prebuilt
   batches with keys spread across the whole keyspace. The previous single-key commits were absorbed
   by the root buffer, making both shapes identical one-node rewrites. Metrics walks now run outside

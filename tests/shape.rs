@@ -1,8 +1,8 @@
 //! Shape and flush acceptance: multiway fanout, equal leaf depth across the whole order × commit-width
 //! matrix, the byte-level flush floor, and buffer partition at every promoted pivot.
 //!
-//! This file is the permanent replacement for the ephemeral probe that reproduced the pre-RFC defect.
-//! The two cases the RFC recorded on the old code are reproduced here as *regression* tests: one
+//! This file contains the regression tests for the historical shape defect.
+//! The two cases recorded on the old code are reproduced here as *regression* tests: one
 //! 20,000-mutation apply, and 20,000 single-mutation applies. On the old code the first produced a
 //! single two-child root over two 10,000-entry leaves, and the second produced only fanout-2 internal
 //! nodes with leaf depths from 1 to 307.
@@ -76,7 +76,7 @@ async fn one_huge_apply_produces_a_wide_balanced_tree() {
     );
 }
 
-/// Stratum's explicit long-key acceptance fixture. It is ignored in the ordinary gate because the
+/// The explicit long-key acceptance fixture. It is ignored in the ordinary gate because the
 /// logical input alone is 400 MiB; CI/release qualification runs it explicitly.
 #[tokio::test]
 #[ignore = "100k x 4KiB capacity qualification; run explicitly in release"]
@@ -352,7 +352,7 @@ async fn an_oversized_message_is_routed_directly_without_a_second_node_shape() {
         leaf_slots: 8,
         message_slots: 24,
         // A large max key makes the worst-case pivot reservation eat most of an internal node, leaving a
-        // buffer blob region too small for one maximum-size message. That is exactly the case the RFC
+        // buffer blob region too small for one maximum-size message. That is exactly the case the format
         // routes directly toward the leaf.
         max_key_bytes: 1024,
         inline_value_bytes: 512,
@@ -409,7 +409,7 @@ async fn an_oversized_message_is_routed_directly_without_a_second_node_shape() {
 }
 
 /// Equal resolved maps built in different orders are ALLOWED to have different roots. Asserting the
-/// opposite would be an accidental confluence claim the RFC explicitly declines.
+/// opposite would be an accidental confluence claim the implementation explicitly declines.
 #[tokio::test]
 #[cfg_attr(miri, ignore = "native order-dependent shape fixture")]
 async fn equal_maps_built_in_different_orders_may_differ_structurally() {

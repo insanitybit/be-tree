@@ -1,5 +1,5 @@
 //! Randomized comparison against an independently implemented `BTreeMap` model, plus the property
-//! tests the RFC requires: reads, scans, tombstones, batch duplicate collapse, replay, reused stamps,
+//! tests the implementation requires: reads, scans, tombstones, batch duplicate collapse, replay, reused stamps,
 //! and snapshots.
 //!
 //! Seeded so every failure is reproducible without a proptest dependency; the seed appears in every

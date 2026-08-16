@@ -28,7 +28,7 @@ recorded here so a consumer's changelog is not the compiler.
 
 ## 0.1.0 (2026-08-13)
 
-Breaking changes relative to the API Stratum integrated at eval #2. Each was individually deliberate;
+Breaking changes relative to the API integrated by the downstream consumer at eval #2. Each was individually deliberate;
 they are recorded here retroactively because they previously shipped undeclared and were discovered
 downstream as a red build.
 
@@ -56,4 +56,4 @@ downstream as a red build.
 ### Removed
 
 - The `explicit-simd` feature and `benches/hashing.rs` — added, measured, rejected, and deleted (see
-  the RFC's reversals section).
+  the recorded reversals section).

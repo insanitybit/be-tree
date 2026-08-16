@@ -30,8 +30,8 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
-// These modules stay public so format auditors and benchmark authors can reproduce the RFC, but they
-// are not the application-facing API. The supported façade is re-exported below.
+// These modules stay public so format auditors and benchmark authors can inspect the implementation,
+// but they are not the application-facing API. The supported façade is re-exported below.
 mod cache;
 #[doc(hidden)]
 pub mod codec;
@@ -184,14 +184,14 @@ impl Mutation {
 }
 
 /// The resolved winner for a key: its order key plus the operation that won. The `Ord` impl **is**
-/// the RFC's total order — see [`WinnerOp`].
+/// the implementation's total order — see [`WinnerOp`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Winner {
     pub(crate) order_key: [u8; VERSION_BYTES],
     pub(crate) op: WinnerOp,
 }
 
-/// The persisted operation of a winning candidate. Its ordering rank is the RFC's exact
+/// The persisted operation of a winning candidate. Its ordering rank is the implementation's exact
 /// `operation_tiebreak`: `(0, inline_value_bytes)`, `(1, ValueObject_ID, logical_length)`, `(2)`.
 /// Delete therefore wins a reused order key, deterministically and without fetching a value object.
 #[derive(Debug, Clone, PartialEq, Eq)]

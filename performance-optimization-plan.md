@@ -1,12 +1,12 @@
 # be-tree performance optimization plan
 
-Status: implementation and integration validation complete for the measured plan: accepted Phase 1 read-path experiments, including the direct scalar `get` path, are implemented; Phase 3 encoder-buffer, Phase 4 flush, and leaf-capacity experiments were rejected by whole-operation evidence; the COW shape harness and Stratum consumer gate are complete. Phase 2 representation changes and Phase 6 concurrency changes were not justified by the measured hotspots, and Phase 5's existing value-separation path was validated rather than replaced. A 2026-08-14 review pass repaired the measurement gates (commit-sized COW shapes, genuinely cold point-get rows, tombstone-scan and mixed-apply Cachegrind rows) and a budget-accounting parity defect, and re-captured the full matrix from committed revision `2fc2330`; see the profiling report's matching update. This closes the measured plan, not remote-store or exhaustive-concurrency validation.
+Status: implementation and integration validation complete for the measured plan: accepted Phase 1 read-path experiments, including the direct scalar `get` path, are implemented; Phase 3 encoder-buffer, Phase 4 flush, and leaf-capacity experiments were rejected by whole-operation evidence; the COW shape harness and downstream consumer gate are complete. Phase 2 representation changes and Phase 6 concurrency changes were not justified by the measured hotspots, and Phase 5's existing value-separation path was validated rather than replaced. A 2026-08-14 review pass repaired the measurement gates (commit-sized COW shapes, genuinely cold point-get rows, tombstone-scan and mixed-apply Cachegrind rows) and a budget-accounting parity defect, and re-captured the full matrix from committed revision `2fc2330`; see the profiling report's matching update. This closes the measured plan, not remote-store or exhaustive-concurrency validation.
 Date: 2026-08-14 (measurement gates re-validated 2026-08-14)
 
 The current implementation retains the existing canonical format and scan merge optimization while
 measuring the next read/write experiments. A three-sample Cachegrind baseline is now captured through
 the repository container; the expanded read, scan-cardinality, apply-shape, and point-get Cachegrind
-matrices are now captured. The Stratum consumer gate has also passed against the local path dependency;
+matrices are now captured. The downstream consumer gate has also passed against the local path dependency;
 remote production storage validation remains an environment limitation, not an unrun repository gate.
 
 The remaining limits are explicit: capacity results report both objects touched and bytes under a
@@ -18,7 +18,7 @@ latency, billing-unit, or multi-worker throughput claim is made.
 
 ## Objective
 
-Improve the primary Stratum workloads without preserving the current internal node layout or
+Improve the primary consumer workloads without preserving the current internal node layout or
 serialized format. The work will prioritize whole-operation latency, allocation pressure, cache
 locality, and storage traffic rather than isolated microbenchmarks.
 
@@ -37,11 +37,11 @@ the same scan matrix.
 
 ## Compatibility and correctness boundary
 
-Stratum does not require the current serialized bytes, node shape, fanout, or format parameters. A
+The downstream consumer does not require the current serialized bytes, node shape, fanout, or format parameters. A
 format-breaking change is acceptable while the system is pre-production and existing data can be
 discarded or rebuilt.
 
-The following properties are nevertheless hard contracts because Stratum observes them through its
+The following properties are nevertheless hard contracts because the downstream consumer observes them through its
 L1 adapter, L2 snapshots, and GC:
 
 1. A finalized immutable object's ID is the hash of its canonical bytes, and the store receives the
@@ -59,7 +59,7 @@ L1 adapter, L2 snapshots, and GC:
    weakened for speed.
 8. One logical commit can still be submitted as one addressed batch to the `NodeStore` adapter.
 
-Changing these properties is out of scope for performance work and requires an explicit Stratum
+Changing these properties is out of scope for performance work and requires an explicit consumer
 architecture decision.
 
 ## Non-goals
@@ -70,7 +70,7 @@ architecture decision.
   matched regression guard.
 - Do not add speculative SIMD, parallelism, or a new hash algorithm before the dominant work is
   removed and the end-to-end contribution is measurable.
-- Do not change Stratum code during the first be-tree experiment series. If the adapter contract must
+- Do not change downstream consumer code during the first be-tree experiment series. If the adapter contract must
   change, stop and document the required coordinated change before proceeding.
 
 ## Measurement protocol
@@ -97,14 +97,14 @@ upsert+tombstone batches. Tombstone behavior remains an explicit regression surf
 shapes in every matrix rerun rather than treating them as incidental.
 
 Before Phase 0, confirm that the key/value sizes, duplicate rate, delete rate, common-prefix length,
-batch widths, and update overlap match Stratum's intended workloads. If Stratum does not yet have
+batch widths, and update overlap match the intended consumer workloads. If the consumer does not yet have
 representative traces, record the synthetic distributions and treat the result as provisional.
 
 At least three deterministic allocation and Cachegrind samples are required. Native timing should use
 enough repetitions to report a distribution rather than a single elapsed time. Warm, cold, and
 capacity-pressure cache cases must remain distinct.
 
-The existing `benches/profile.rs`, `benches/allocations.rs`, `tools/profile/` commands, and Stratum
+The existing `benches/profile.rs`, `benches/allocations.rs`, `tools/profile/` commands, and downstream
 consumer workload should be reused where trustworthy. If a harness cannot consume results, fails to
 chain returned roots, or excludes meaningful setup from the measured region, repair the harness before
 using its numbers to select an optimization.
@@ -233,7 +233,7 @@ For each retained experiment:
 1. Run focused tree, codec, corruption, search-equivalence, read-path, and write-path tests relevant to
    the changed representation.
 2. Run the proportional full crate gates.
-3. Run the Stratum consumer build/tests against the new dependency.
+3. Run the downstream consumer build/tests against the new dependency.
 4. Exercise content-addressed storage with hash mismatch, missing object, bounded read, and GC walk
    cases.
 5. Re-run the identical performance matrix and inspect the new hotspot profile.
@@ -247,7 +247,7 @@ tested, or if the benchmark does not consume returned roots/results.
   workload result is non-degrading.
 - A timing win smaller than measurement noise is rejected unless it also removes a deterministic,
   material allocation or storage cost.
-- A regression in Stratum-visible semantics is an immediate rejection regardless of speed.
+- A regression in consumer-visible semantics is an immediate rejection regardless of speed.
 - A format change that invalidates existing data is acceptable only when explicitly labeled as a reset
   boundary; do not silently claim it is compatible with existing stores.
 - Preserve each accepted experiment as a narrow, independently reviewable commit or patch series.
@@ -271,6 +271,6 @@ The reviewing agent should specifically challenge:
 1. Whether the content-addressed COW/Merkle invariants are stated completely.
 2. Whether the proposed grouped traversal can preserve duplicate-key and input-order semantics.
 3. Whether out-of-line values add GC or fetch costs that the matrix would miss.
-4. Whether the workload sizes and value/key distributions represent Stratum's actual use.
+4. Whether the workload sizes and value/key distributions represent the consumer's actual use.
 5. Whether any proposed format reset could accidentally affect retained snapshots or existing L0 data.
 6. Whether a phase has a sufficiently measurable hypothesis to justify implementation.

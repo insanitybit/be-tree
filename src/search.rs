@@ -278,7 +278,7 @@ mod tests {
         .probe(needle)
     }
 
-    /// The adversarial set the RFC names: empty keys, embedded zeroes, all-0xff heads, long shared
+    /// The adversarial set: empty keys, embedded zeroes, all-0xff heads, long shared
     /// prefixes, probes outside the prefix, and keys shorter than `skip`.
     fn hard_key_sets() -> Vec<Vec<Vec<u8>>> {
         let mut sets: Vec<Vec<Vec<u8>>> = Vec::new();

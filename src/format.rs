@@ -25,7 +25,7 @@ pub const EXTERNAL_ID_BYTES: usize = 32;
 /// languages cannot be confused before hashing.
 pub const NODE_MAGIC: [u8; 8] = *b"BeTreeN1";
 
-/// `op` column byte values. Their numeric order **is** the leading discriminant of the RFC's
+/// `op` column byte values. Their numeric order **is** the leading discriminant of the format's
 /// `operation_tiebreak`, so delete wins a reused order key.
 pub const OP_INLINE: u8 = 0;
 pub const OP_EXTERNAL: u8 = 1;
@@ -231,8 +231,7 @@ fn validate_params(p: &FormatParams) -> Result<(), CapacityError> {
 }
 
 impl Format {
-    /// The selected default. Chosen from the capacity matrix in `benches/` — see
-    /// `rfcs/0001-simd-native-node-architecture.md` §"Selected constants".
+    /// The selected default, chosen from the capacity matrix in `benches/`.
     pub fn selected() -> Format {
         Format::new(FormatParams {
             node_bytes: 64 * 1024,
@@ -364,7 +363,7 @@ impl Format {
                 p.f_max
             )));
         }
-        // The RFC's two inequalities, restated over the derived floor.
+        // The format's two inequalities, restated over the derived floor.
         debug_assert!(buffer_bytes >= p.f_max * min_flush_bytes);
         debug_assert!(p.message_slots * desc_bytes >= p.f_max * min_flush_bytes);
 
@@ -718,7 +717,7 @@ impl Default for Format {
 mod tests {
     use super::*;
 
-    /// Every format the crate ships must satisfy the RFC's proofs, including the two flush
+    /// Every format the crate ships must satisfy the format invariants, including the two flush
     /// inequalities that make an undersized flush impossible.
     #[test]
     fn shipped_formats_satisfy_the_flush_inequalities() {

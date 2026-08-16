@@ -78,6 +78,6 @@ warmed key. It also runs chained `cow-low` and `cow-high` rewrite shapes: commit
 batches, low overlap inserting fresh keys spread across every leaf versus high overlap rewriting
 existing keys, with a setup twin that builds the same batches and applies none. They consume each
 returned root and use `MemStore`, so adapter-level object-sharing and bytes-written claims still
-require the Stratum consumer harness. `cachegrind.tsv` contains one median row per shape;
+require a downstream consumer harness. `cachegrind.tsv` contains one median row per shape;
 `cachegrind-variability.tsv` contains the min/median/max across the three deterministic repeats;
 `commands.txt` records every profiled invocation and `metadata.txt` records the fixture dimensions.

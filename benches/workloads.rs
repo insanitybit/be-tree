@@ -1,4 +1,4 @@
-//! The RFC's workload list: point reads (hit and miss), 256-key `get_many`, 64-prefix
+//! The workload list: point reads (hit and miss), 256-key `get_many`, 64-prefix
 //! `scan_prefix_many`, one-mutation and 256-mutation `apply`, `diff` at fixed logical divergence, and
 //! read waves with verification on and off.
 //!
