@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
-use be_tree::codec;
-use be_tree::format::Format;
-use be_tree::store::{AddressedObject, NodeStore};
-use be_tree::tree::BeTree;
-use be_tree::{AccessHint, BlockId, Mutation, MutationOp, TreeError, VERSION_BYTES, VersionStamp};
+use cbe_tree::codec;
+use cbe_tree::format::Format;
+use cbe_tree::store::{AddressedObject, NodeStore};
+use cbe_tree::tree::BeTree;
+use cbe_tree::{AccessHint, BlockId, Mutation, MutationOp, TreeError, VERSION_BYTES, VersionStamp};
 
 /// A deliberately small target-store model for comparing node shapes. It separates dependent-wave
 /// latency from transferred bytes; callers supply measured target values rather than inheriting a
@@ -362,7 +362,7 @@ pub async fn check<S: NodeStore>(tree: &BeTree<S>, root: BlockId) -> Result<Tree
                     "node {id} holds key {k:?} outside its owned range {range:?}"
                 )));
             }
-            if v.entry_op(i) == be_tree::format::OP_EXTERNAL {
+            if v.entry_op(i) == cbe_tree::format::OP_EXTERNAL {
                 shape.external_values += 1;
             }
         }
@@ -445,7 +445,7 @@ pub async fn check_balanced<S: NodeStore>(
 // ---------------------------------------------------------------- reference model
 
 /// One candidate in the model's ordering. The comparator is implemented here **independently** of
-/// [`be_tree::Winner`], so a bug in one does not silently validate the other.
+/// [`cbe_tree::Winner`], so a bug in one does not silently validate the other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cand {
     order_key: [u8; VERSION_BYTES],
@@ -506,7 +506,7 @@ impl Model {
                     value: Some(v.to_vec()),
                 },
                 MutationOp::Upsert(v) => {
-                    let obj = be_tree::value::encode(fmt.schema_id(), v);
+                    let obj = cbe_tree::value::encode(fmt.schema_id(), v);
                     Cand {
                         order_key: stamp.order_key,
                         rank: 1,

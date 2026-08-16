@@ -225,6 +225,9 @@ pub struct BeTree<S: NodeStore> {
     class: S::Class,
     verify: VerifyPolicy,
     budget: WorkBudget,
+    /// Tombstones whose stamp orders below this floor are physically dropped at leaf rewrite.
+    /// `VersionStamp::ZERO` (the default) keeps everything. See [`Self::with_retention_floor`].
+    retention_floor: VersionStamp,
     /// Decoded-node cache. A node is immutable content-addressed bytes, so a cached decode is coherent
     /// forever — zero invalidation, eviction is pure capacity. Weighted by the retained byte string.
     cache: ObjectCache<Arc<NodeView>>,
@@ -414,6 +417,7 @@ impl<S: NodeStore> BeTree<S> {
             class: S::Class::default(),
             verify: VerifyPolicy::default(),
             budget: WorkBudget::default(),
+            retention_floor: VersionStamp::ZERO,
             cache: ObjectCache::new(CacheConfig::default().node_bytes, |_id, view| {
                 view_weight(view)
             }),
@@ -446,6 +450,27 @@ impl<S: NodeStore> BeTree<S> {
         self.budget = budget;
         self
     }
+    /// Set the retention floor: at every leaf rewrite, a TOMBSTONE whose stamp orders strictly below
+    /// `floor` is physically dropped. Without a floor, tombstones persist forever — they must, to
+    /// shadow a lower-stamped write that might still arrive — so a delete-heavy tree grows without
+    /// bound even as its live set shrinks. `VersionStamp::ZERO` keeps everything (the default).
+    ///
+    /// Live winners are NEVER dropped, whatever their stamp: a rarely-updated key whose only version
+    /// predates the floor keeps resolving to its value. (Per-key version *history* needs no floor in
+    /// this design — merge already keeps exactly one winner per key; the floor's job is tombstone
+    /// space.)
+    ///
+    /// The caller's side of the contract: no future batch may carry a stamp ordering below the floor.
+    /// The floor is a horizon — once a tombstone below it is purged, a sub-floor upsert that would
+    /// have lost to that tombstone can win instead (resurrection). Producers using the [`crate::hlc`]
+    /// adapter typically derive the floor from their oldest possible in-flight commit.
+    ///
+    /// Purging changes node bytes, so equal logical content with different floors yields different
+    /// roots. That adds nothing new: the tree is already not confluent across operation orders.
+    pub fn with_retention_floor(mut self, floor: VersionStamp) -> Self {
+        self.retention_floor = floor;
+        self
+    }
     /// Enable lock-free workload counters. Recording is off by default.
     pub fn record_metrics(mut self) -> Self {
         self.metrics = Arc::new(Metrics::recording());
@@ -460,6 +485,7 @@ impl<S: NodeStore> BeTree<S> {
             class,
             verify: self.verify,
             budget: self.budget,
+            retention_floor: self.retention_floor,
             cache: self.cache.clone(),
             values: self.values.clone(),
             node_flights: self.node_flights.clone(),
@@ -1540,7 +1566,25 @@ impl<S: NodeStore> BeTree<S> {
         })
     }
 
-    fn emit_leaves(&self, entries: Vec<Entry>, staged: &mut Staged) -> Result<Rewrite, TreeError> {
+    /// Drop tombstones whose stamp orders strictly below the retention floor. Leaf level ONLY, after
+    /// the merge: a buffered tombstone must first reach the leaf and beat the entry it deletes; a live
+    /// winner is never dropped, whatever its stamp (a cold key must not resolve to absent). Purging
+    /// the tombstone itself is read-preserving under the floor contract — the key reads as absent
+    /// either way — and reclaims the leaf space that otherwise persists forever.
+    fn compact_below_floor(&self, entries: &mut Vec<Entry>) {
+        if self.retention_floor == VersionStamp::ZERO {
+            return; // keep-all fast path (the default)
+        }
+        entries
+            .retain(|e| !e.is_tombstone() || e.order_key >= self.retention_floor.order_key);
+    }
+
+    fn emit_leaves(
+        &self,
+        mut entries: Vec<Entry>,
+        staged: &mut Staged,
+    ) -> Result<Rewrite, TreeError> {
+        self.compact_below_floor(&mut entries);
         let packed = self.pack_leaves(entries);
         self.metrics.leaves_written(packed.len() as u64);
         let mut layer = Vec::with_capacity(packed.len());

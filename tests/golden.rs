@@ -10,11 +10,11 @@ mod support;
 
 use std::sync::Arc;
 
-use be_tree::codec::{self, Entry, NodeView};
-use be_tree::format::Format;
-use be_tree::search::head_of;
-use be_tree::store::MemStore;
-use be_tree::{BeTree, BlockId, Mutation, VERSION_BYTES, VersionStamp};
+use cbe_tree::codec::{self, Entry, NodeView};
+use cbe_tree::format::Format;
+use cbe_tree::search::head_of;
+use cbe_tree::store::MemStore;
+use cbe_tree::{BeTree, BlockId, Mutation, VERSION_BYTES, VersionStamp};
 use bytes::Bytes;
 
 fn hex(id: BlockId) -> String {
@@ -96,7 +96,7 @@ fn the_shipped_schema_ids_are_pinned() {
     pin("VERSION_BYTES", &VERSION_BYTES.to_string(), "28");
     pin(
         "SCHEMA_ID_BYTES",
-        &be_tree::format::SCHEMA_ID_BYTES.to_string(),
+        &cbe_tree::format::SCHEMA_ID_BYTES.to_string(),
         "16",
     );
 }
@@ -168,19 +168,19 @@ fn a_fixture_internal_node_encodes_to_pinned_bytes() {
 
 #[test]
 fn a_value_object_encodes_to_pinned_bytes() {
-    let v = be_tree::value::encode(Format::tiny().schema_id(), b"the quick brown fox");
+    let v = cbe_tree::value::encode(Format::tiny().schema_id(), b"the quick brown fox");
     pin(
         "value.fox",
         &hex(v.id),
         "168dc63ffcc319c537a05fe11fcbfc5e800ede232a7771620adf0d41cfd305fa",
     );
-    assert_eq!(v.bytes.len(), be_tree::value::ENVELOPE_BYTES + 19);
+    assert_eq!(v.bytes.len(), cbe_tree::value::ENVELOPE_BYTES + 19);
     pin(
         "ENVELOPE_BYTES",
-        &be_tree::value::ENVELOPE_BYTES.to_string(),
+        &cbe_tree::value::ENVELOPE_BYTES.to_string(),
         "32",
     );
-    let empty = be_tree::value::encode(Format::tiny().schema_id(), b"");
+    let empty = cbe_tree::value::encode(Format::tiny().schema_id(), b"");
     pin(
         "value.empty",
         &hex(empty.id),

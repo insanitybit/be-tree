@@ -14,9 +14,9 @@ mod support;
 
 use std::sync::Arc;
 
-use be_tree::BeTree;
-use be_tree::format::{Format, FormatParams};
-use be_tree::store::MemStore;
+use cbe_tree::BeTree;
+use cbe_tree::format::{Format, FormatParams};
+use cbe_tree::store::MemStore;
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 use support::{self as harness, CountingStore, KeyShape, StoreModel};
@@ -25,7 +25,7 @@ use support::{self as harness, CountingStore, KeyShape, StoreModel};
 /// for records of about `record_bytes`.
 fn candidate(node_bytes: usize, f_max: usize, record_bytes: usize) -> Option<Format> {
     // Descriptor cost per slot is fixed by the format; aim for slots ~= node_bytes / (desc + record).
-    let desc = 8 + 8 + be_tree::VERSION_BYTES + 1 + 4;
+    let desc = 8 + 8 + cbe_tree::VERSION_BYTES + 1 + 4;
     let slots = (node_bytes / (desc + record_bytes)).max(4);
     // The worst-case pivot reservation is `(f_max - 1) * max_key_bytes`, so a small node with a large key
     // limit is *rejected by the format proofs* rather than silently made to work. Walk the key limit down
@@ -40,7 +40,7 @@ fn candidate(node_bytes: usize, f_max: usize, record_bytes: usize) -> Option<For
             message_slots: slots,
             max_key_bytes,
             inline_value_bytes,
-            max_value_bytes: (4 << 20) - be_tree::value::ENVELOPE_BYTES,
+            max_value_bytes: (4 << 20) - cbe_tree::value::ENVELOPE_BYTES,
             max_object_bytes: 8 << 20,
             max_tree_level: 32,
             version_domain: *b"be-tree/bench\0\0\0",

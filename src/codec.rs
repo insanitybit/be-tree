@@ -75,6 +75,10 @@ impl Entry {
         self.key.len() + self.span.len()
     }
 
+    pub(crate) fn is_tombstone(&self) -> bool {
+        self.op == OP_TOMBSTONE
+    }
+
     /// The comparable winner tuple. This is the *only* place a persisted candidate becomes ordered.
     pub(crate) fn winner(&self) -> Winner {
         Winner {

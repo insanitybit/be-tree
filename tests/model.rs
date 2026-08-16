@@ -9,9 +9,9 @@ mod support;
 
 use std::sync::Arc;
 
-use be_tree::format::Format;
-use be_tree::store::MemStore;
-use be_tree::{BeTree, Mutation, VersionStamp};
+use cbe_tree::format::Format;
+use cbe_tree::store::MemStore;
+use cbe_tree::{BeTree, Mutation, VersionStamp};
 use bytes::Bytes;
 use support::{self as harness, KeyShape, Model, Rng};
 
@@ -28,7 +28,7 @@ async fn run_stream(seed: u64, ops: usize, key_space: usize) {
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
     let mut root = t.empty_root().await.unwrap();
-    let mut snapshots: Vec<(be_tree::BlockId, Model)> = Vec::new();
+    let mut snapshots: Vec<(cbe_tree::BlockId, Model)> = Vec::new();
     let inline = fmt.inline_value_bytes();
 
     let key = |i: usize| -> Bytes {

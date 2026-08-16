@@ -7,10 +7,10 @@ mod support;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
-use be_tree::format::Format;
-use be_tree::store::MemStore;
-use be_tree::tree::CacheConfig;
-use be_tree::{BeTree, Mutation, VersionStamp};
+use cbe_tree::format::Format;
+use cbe_tree::store::MemStore;
+use cbe_tree::tree::CacheConfig;
+use cbe_tree::{BeTree, Mutation, VersionStamp};
 use bytes::Bytes;
 use support::{self as harness, CountingStore, KeyShape};
 
@@ -204,12 +204,12 @@ async fn a_shared_external_value_is_fetched_once_not_once_per_reference() {
 /// the same id with an inconsistent authenticated length.
 #[tokio::test]
 async fn every_external_reference_validates_its_own_length() {
-    use be_tree::BlockId;
-    use be_tree::codec::{self, Entry};
-    use be_tree::store::{AddressedObject, NodeStore};
+    use cbe_tree::BlockId;
+    use cbe_tree::codec::{self, Entry};
+    use cbe_tree::store::{AddressedObject, NodeStore};
 
     let fmt = Arc::new(Format::selected());
-    let value = be_tree::value::encode(fmt.schema_id(), &vec![b'v'; 4096]);
+    let value = cbe_tree::value::encode(fmt.schema_id(), &vec![b'v'; 4096]);
     let entries = vec![
         Entry::external(Bytes::from_static(b"a"), stamp(1).order_key, value.id, 4096),
         Entry::external(Bytes::from_static(b"b"), stamp(1).order_key, value.id, 4097),
@@ -251,8 +251,8 @@ async fn every_external_reference_validates_its_own_length() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(miri, ignore = "native concurrent stampede fixture")]
 async fn concurrent_cold_reads_of_one_external_value_do_not_stampede() {
-    use be_tree::store::{AddressedObject, NodeStore};
-    use be_tree::{AccessHint, BlockId, TreeError};
+    use cbe_tree::store::{AddressedObject, NodeStore};
+    use cbe_tree::{AccessHint, BlockId, TreeError};
 
     struct SlowStore(Arc<MemStore>);
     impl NodeStore for SlowStore {
@@ -320,8 +320,8 @@ async fn concurrent_cold_reads_of_one_external_value_do_not_stampede() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(miri, ignore = "native 32-reader multi-value fixture")]
 async fn concurrent_multi_value_waves_fetch_each_id_once() {
-    use be_tree::store::{AddressedObject, NodeStore};
-    use be_tree::{AccessHint, BlockId, TreeError};
+    use cbe_tree::store::{AddressedObject, NodeStore};
+    use cbe_tree::{AccessHint, BlockId, TreeError};
 
     struct SlowStore(Arc<MemStore>);
     impl NodeStore for SlowStore {
@@ -391,8 +391,8 @@ async fn concurrent_multi_value_waves_fetch_each_id_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(miri, ignore = "native concurrent root fixture")]
 async fn concurrent_cold_reads_of_one_root_do_not_stampede() {
-    use be_tree::store::{AddressedObject, NodeStore};
-    use be_tree::{AccessHint, BlockId, TreeError};
+    use cbe_tree::store::{AddressedObject, NodeStore};
+    use cbe_tree::{AccessHint, BlockId, TreeError};
 
     /// A store that yields before answering, widening the window in which a stampede can form.
     struct SlowStore(Arc<MemStore>);
@@ -454,8 +454,8 @@ async fn concurrent_cold_reads_of_one_root_do_not_stampede() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(miri, ignore = "native overlapping-wave concurrency fixture")]
 async fn overlapping_multi_id_waves_share_their_fetches() {
-    use be_tree::store::{AddressedObject, NodeStore};
-    use be_tree::{AccessHint, BlockId, TreeError};
+    use cbe_tree::store::{AddressedObject, NodeStore};
+    use cbe_tree::{AccessHint, BlockId, TreeError};
 
     /// Yields repeatedly before answering, so every reader is in flight at once.
     struct SlowStore(Arc<MemStore>);
@@ -532,8 +532,8 @@ async fn overlapping_multi_id_waves_share_their_fetches() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(miri, ignore = "native cancellation scheduling fixture")]
 async fn cancelling_a_wave_owner_does_not_poison_later_reads() {
-    use be_tree::store::{AddressedObject, NodeStore};
-    use be_tree::{AccessHint, BlockId, TreeError};
+    use cbe_tree::store::{AddressedObject, NodeStore};
+    use cbe_tree::{AccessHint, BlockId, TreeError};
     use std::sync::atomic::AtomicBool;
 
     struct CancelOnceStore {

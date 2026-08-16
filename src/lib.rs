@@ -1,6 +1,7 @@
-//! A content-addressed, copy-on-write **buffered B-tree in the Bε-tree family**: updates enter an
-//! internal node's message buffer, a full buffer flushes the heaviest child group one level down, and a
-//! read combines the leaf with the messages found along the root-to-leaf path.
+//! **cbε-tree**: a content-addressed, copy-on-write **Bε-tree** (the package is named `cbe-tree`
+//! because crates.io names must be ASCII). Updates enter an internal node's message buffer, a full
+//! buffer flushes the heaviest child group one level down, and a read combines the leaf with the
+//! messages found along the root-to-leaf path.
 //!
 //! Three properties, and they compound:
 //!

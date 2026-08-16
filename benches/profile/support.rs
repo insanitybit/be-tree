@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::hint::black_box;
 use std::sync::Arc;
 
-use be_tree::codec::{self, NodeView};
-use be_tree::{BeTree, BlockId, Format, MemStore, Mutation, ObjectKind, VersionStamp};
+use cbe_tree::codec::{self, NodeView};
+use cbe_tree::{BeTree, BlockId, Format, MemStore, Mutation, ObjectKind, VersionStamp};
 use bytes::Bytes;
 
 pub const KEYS: usize = 10_000;

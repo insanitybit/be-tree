@@ -1,11 +1,13 @@
 [package]
-name = "be-tree"
-description = "Content-addressed copy-on-write buffered B-tree: write-optimized, Merkle by construction"
+# Display name: cbε-tree (content-addressed Bε-tree). Package names must be ASCII on crates.io,
+# and `be-tree` is already taken there.
+name = "cbe-tree"
+description = "cbε-tree: content-addressed copy-on-write Bε-tree — write-optimized, Merkle by construction"
 edition = "2024"
 version = "0.1.0"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/insanitybit/be-tree"
+repository = "https://github.com/insanitybit/cbe-tree"
 readme = "README.md"
 keywords = ["b-tree", "content-addressed", "copy-on-write", "merkle", "mvcc"]
 categories = ["data-structures", "database-implementations"]

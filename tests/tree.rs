@@ -5,10 +5,10 @@ mod support;
 
 use std::sync::Arc;
 
-use be_tree::format::Format;
-use be_tree::store::MemStore;
-use be_tree::tree::{CacheConfig, VerifyPolicy};
-use be_tree::{BeTree, BlockId, CapacityError, Mutation, TreeError, VersionStamp, WorkBudget};
+use cbe_tree::format::Format;
+use cbe_tree::store::MemStore;
+use cbe_tree::tree::{CacheConfig, VerifyPolicy};
+use cbe_tree::{BeTree, BlockId, CapacityError, Mutation, TreeError, VersionStamp, WorkBudget};
 use bytes::Bytes;
 use support as harness;
 
@@ -635,14 +635,14 @@ async fn visit_budget_prices_scalar_and_batched_reads_identically() {
             .await
             .unwrap()
             .iter()
-            .any(|(kind, _)| *kind == be_tree::ObjectKind::Value),
+            .any(|(kind, _)| *kind == cbe_tree::ObjectKind::Value),
         "fixture must produce an out-of-line value"
     );
 
     // Find the smallest visit budget at which each operation succeeds. Fresh tree per probe: budgets
     // are per-operation, and visits are charged for cache hits too, so caching must not change the
     // count.
-    let probe_tree = |budget: u64| {
+    let procbe_tree = |budget: u64| {
         BeTree::with_format(store.clone(), Format::tiny()).with_budget(WorkBudget {
             max_objects: budget,
             max_fetched_bytes: u64::MAX,
@@ -652,11 +652,11 @@ async fn visit_budget_prices_scalar_and_batched_reads_identically() {
     let mut min_one = None;
     let mut min_dup = None;
     for budget in 1..64u64 {
-        if min_get.is_none() && probe_tree(budget).get(root, b"k").await.is_ok() {
+        if min_get.is_none() && procbe_tree(budget).get(root, b"k").await.is_ok() {
             min_get = Some(budget);
         }
         if min_one.is_none()
-            && probe_tree(budget)
+            && procbe_tree(budget)
                 .get_many(root, &[b"k".as_ref()])
                 .await
                 .is_ok()
@@ -664,7 +664,7 @@ async fn visit_budget_prices_scalar_and_batched_reads_identically() {
             min_one = Some(budget);
         }
         if min_dup.is_none()
-            && probe_tree(budget)
+            && procbe_tree(budget)
                 .get_many(root, &[b"k".as_ref(), b"k".as_ref()])
                 .await
                 .is_ok()
@@ -686,11 +686,103 @@ async fn visit_budget_prices_scalar_and_batched_reads_identically() {
     );
 }
 
+// ------------------------------------------------------------------ retention floor
+
+/// THE discriminating retention-floor property: a live winner is never dropped, whatever its stamp.
+/// A cold key written once, below the floor, must keep resolving to its value through arbitrarily many
+/// leaf rewrites. A naive `retain(stamp >= floor)` passes every "old versions are dropped" test and
+/// fails exactly this one — losing rarely-updated keys is the bug the floor's contract exists to
+/// prevent.
+#[tokio::test]
+#[cfg_attr(miri, ignore = "native multi-rewrite fixture")]
+async fn a_live_winner_below_the_retention_floor_survives_leaf_rewrites() {
+    let store = Arc::new(MemStore::new());
+    let t = BeTree::with_format(store, Format::tiny())
+        .with_retention_floor(VersionStamp::from_counter(1_000));
+    let empty = t.empty_root().await.unwrap();
+
+    // The cold key: written ONCE, with a stamp far below the floor.
+    let mut root = t.apply(empty, stamp(1), vec![up("cold/key", "survivor")]).await.unwrap();
+
+    // Force repeated flushes and leaf rewrites around it with above-floor traffic.
+    for round in 0..40u64 {
+        let muts: Vec<Mutation> = (0..32u64)
+            .map(|i| up(&format!("hot/{:04}", (round * 32 + i) % 200), "churn"))
+            .collect();
+        root = t.apply(root, stamp(2_000 + round), muts).await.unwrap();
+    }
+
+    assert_eq!(
+        t.get(root, b"cold/key").await.unwrap(),
+        Some(Bytes::from("survivor")),
+        "a cold key whose only version predates the floor must never resolve to absent"
+    );
+    harness::check_balanced(&t, root).await.expect("balanced");
+}
+
+/// The floor's remaining job in the one-winner-per-key design: tombstones below the horizon are
+/// physically purged at leaf rewrite, while every observable read stays identical to a floorless tree
+/// fed the same operations.
+#[tokio::test]
+#[cfg_attr(miri, ignore = "native two-tree comparison fixture")]
+async fn tombstones_below_the_retention_floor_are_purged_and_reads_are_preserved() {
+    let build = |floor: Option<VersionStamp>| {
+        let store = Arc::new(MemStore::new());
+        let t = BeTree::with_format(store, Format::tiny());
+        match floor {
+            Some(f) => t.with_retention_floor(f),
+            None => t,
+        }
+    };
+    let floored = build(Some(VersionStamp::from_counter(1_000)));
+    let plain = build(None);
+
+    let mut roots = Vec::new();
+    for t in [&floored, &plain] {
+        let mut root = t.empty_root().await.unwrap();
+        // 200 keys live, then 150 of them tombstoned below the floor.
+        let ups: Vec<Mutation> = (0..200u32).map(|i| up(&format!("k{i:04}"), "v")).collect();
+        root = t.apply(root, stamp(1), ups).await.unwrap();
+        let dels: Vec<Mutation> = (0..150u32)
+            .map(|i| Mutation::tombstone(Bytes::from(format!("k{i:04}"))))
+            .collect();
+        root = t.apply(root, stamp(2), dels).await.unwrap();
+        // Above-floor churn touching the whole range, so every leaf is rewritten post-floor.
+        for round in 0..10u64 {
+            let muts: Vec<Mutation> = (150..200u32)
+                .map(|i| up(&format!("k{i:04}"), &format!("v{round}")))
+                .collect();
+            root = t.apply(root, stamp(2_000 + round), muts).await.unwrap();
+        }
+        roots.push(root);
+    }
+
+    // Observable equivalence: deleted keys absent, live keys equal, on both trees.
+    for i in 0..200u32 {
+        let key = format!("k{i:04}");
+        let a = floored.get(roots[0], key.as_bytes()).await.unwrap();
+        let b = plain.get(roots[1], key.as_bytes()).await.unwrap();
+        assert_eq!(a, b, "floor must not change any observable read ({key})");
+        assert_eq!(a.is_none(), i < 150, "tombstoned iff below 150 ({key})");
+    }
+
+    // Physical purge: the floored tree carries fewer persisted leaf entries, because the 150
+    // below-floor tombstones were dropped wherever a leaf was rewritten.
+    let shape_floored = harness::check(&floored, roots[0]).await.unwrap();
+    let shape_plain = harness::check(&plain, roots[1]).await.unwrap();
+    assert!(
+        shape_floored.leaf_entries < shape_plain.leaf_entries,
+        "purge must reclaim leaf entries: floored {} !< plain {}",
+        shape_floored.leaf_entries,
+        shape_plain.leaf_entries
+    );
+}
+
 /// A tree taller than `max_tree_level` cannot be built: the attempt fails and publishes nothing.
 #[tokio::test]
 #[cfg_attr(miri, ignore = "native maximum-depth root-growth fixture")]
 async fn root_growth_beyond_max_tree_level_fails_without_publication() {
-    use be_tree::format::FormatParams;
+    use cbe_tree::format::FormatParams;
     // f_max = 3, max_tree_level = 1: a tree can hold at most 3 leaves.
     let params = FormatParams {
         max_tree_level: 1,
@@ -732,8 +824,8 @@ async fn root_growth_beyond_max_tree_level_fails_without_publication() {
 #[tokio::test]
 #[cfg_attr(miri, ignore = "native access-hint tree fixture")]
 async fn the_tree_tells_the_store_what_kind_of_read_each_wave_is() {
-    use be_tree::AccessHint;
-    use be_tree::store::{AddressedObject, NodeStore};
+    use cbe_tree::AccessHint;
+    use cbe_tree::store::{AddressedObject, NodeStore};
     use std::sync::Mutex;
 
     /// Records the hint of every read it serves.
@@ -828,8 +920,8 @@ async fn the_tree_tells_the_store_what_kind_of_read_each_wave_is() {
 #[tokio::test]
 #[cfg_attr(miri, ignore = "native malformed-batch multi-node fixture")]
 async fn a_malformed_batched_read_cardinality_is_rejected_before_bytes_meet_ids() {
-    use be_tree::AccessHint;
-    use be_tree::store::{AddressedObject, NodeStore};
+    use cbe_tree::AccessHint;
+    use cbe_tree::store::{AddressedObject, NodeStore};
 
     /// A store that returns one fewer result than requested.
     struct ShortStore(Arc<MemStore>);
@@ -876,7 +968,7 @@ async fn a_malformed_batched_read_cardinality_is_rejected_before_bytes_meet_ids(
         matches!(
             e,
             TreeError::Decode {
-                reason: be_tree::DecodeError::BatchCardinality { .. },
+                reason: cbe_tree::DecodeError::BatchCardinality { .. },
                 ..
             }
         ),

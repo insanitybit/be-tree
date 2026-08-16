@@ -9,9 +9,9 @@ mod support;
 
 use std::sync::Arc;
 
-use be_tree::codec::{self, Entry, NodeView};
-use be_tree::format::{Format, FormatParams};
-use be_tree::{VERSION_BYTES, VersionStamp};
+use cbe_tree::codec::{self, Entry, NodeView};
+use cbe_tree::format::{Format, FormatParams};
+use cbe_tree::{VERSION_BYTES, VersionStamp};
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use support::{Histogram, KeyShape, Rng};

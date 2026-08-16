@@ -9,10 +9,10 @@ mod support;
 
 use std::sync::Arc;
 
-use be_tree::codec::{self, Entry, NodeView};
-use be_tree::format::{Format, FormatParams};
-use be_tree::search::{Surface, head_of, head_skip};
-use be_tree::{VERSION_BYTES, VersionStamp};
+use cbe_tree::codec::{self, Entry, NodeView};
+use cbe_tree::format::{Format, FormatParams};
+use cbe_tree::search::{Surface, head_of, head_skip};
+use cbe_tree::{VERSION_BYTES, VersionStamp};
 use bytes::Bytes;
 use support::Rng;
 
@@ -228,8 +228,8 @@ fn child_routing_agrees_with_the_reference() {
             .expect("format"),
         );
         let pivot_bytes: Vec<Bytes> = pivots.iter().map(|p| Bytes::copy_from_slice(p)).collect();
-        let children: Vec<be_tree::BlockId> = (0..pivots.len() + 1)
-            .map(|i| be_tree::BlockId([(i as u8) | 0x80; 32]))
+        let children: Vec<cbe_tree::BlockId> = (0..pivots.len() + 1)
+            .map(|i| cbe_tree::BlockId([(i as u8) | 0x80; 32]))
             .collect();
         let bytes = codec::encode_internal(&fmt, 1, &pivot_bytes, &children, &[]).expect("fits");
         let view = NodeView::decode(&fmt, None, bytes).expect("valid");
@@ -253,7 +253,7 @@ fn child_routing_agrees_with_the_reference() {
 #[test]
 #[cfg_attr(miri, ignore = "native adaptive-threshold matrix")]
 fn the_occupancy_dispatch_agrees_with_the_reference_at_its_threshold() {
-    let t = be_tree::search::ADAPTIVE_THRESHOLD;
+    let t = cbe_tree::search::ADAPTIVE_THRESHOLD;
     for n in [t - 1, t, t + 1] {
         let mut rng = Rng::new(n as u64);
         let keys: Vec<Vec<u8>> = {
