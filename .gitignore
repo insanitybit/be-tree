@@ -1,3 +1,5 @@
 /target
+# Stray alternate build dirs (e.g. `--target-dir target-fix`) must not look like source.
+/target-*
 **/*.rs.bk
 .DS_Store

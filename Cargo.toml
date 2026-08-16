@@ -1,27 +1,52 @@
 [package]
 name = "be-tree"
-description = "Content-addressed copy-on-write Bε-tree: write-optimised, Merkle by construction, MVCC without locks"
+description = "Content-addressed copy-on-write buffered B-tree: write-optimized, Merkle by construction"
 edition = "2024"
 version = "0.1.0"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/insanitybit/be-tree"
 readme = "README.md"
 keywords = ["b-tree", "content-addressed", "copy-on-write", "merkle", "mvcc"]
 categories = ["data-structures", "database-implementations"]
-publish = false # flip to true when ready to publish to crates.io
 
 [dependencies]
-async-trait = "0.1"
 blake3 = "1"
 bytes = "1"
+event-listener = "5"
 foldhash = "0.2"
 moka = { version = "0.12", features = ["future"] }
-postcard = { version = "1", features = ["use-std"] }
-serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+hotpath = { version = "0.23", optional = true }
+
+[features]
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-alloc = ["hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath/hotpath-cpu"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+
+[[bench]]
+name = "search"
+harness = false
+
+[[bench]]
+name = "capacity"
+harness = false
+
+[[bench]]
+name = "workloads"
+harness = false
+
+[[bench]]
+name = "profile"
+harness = false
+
+[[bench]]
+name = "allocations"
+harness = false
 
 [lints.clippy]
 todo = "allow"

@@ -1,1207 +1,2195 @@
-//! The content-addressed COW Bε-tree. A node's identity **is** its BLAKE3 content hash, so the tree
-//! is a Merkle tree by construction: equal subtrees share a BlockId, which is what makes
-//! `subtree_hash` diff O(divergence) and snapshots free.
+//! The content-addressed COW buffered tree.
 //!
-//! Interior nodes carry a small **message buffer**: a write is absorbed near the root and flushed
-//! downward lazily. Consequences: commit work is O(messages) at the root, not O(log n)
-//! full rewrites; `tree_put` never mutates — it rewrites only the changed root→leaf path as new
-//! blocks and returns a NEW root BlockId.
+//! **Descent** is wave-synchronous: for a loaded BFS wave, probes are grouped by node and each
+//! validated head surface is reused for every probe assigned to that node. Multi-key navigation costs
+//! O(tree depth) dependent `get_many` waves plus at most one batched value-object wave for out-of-line
+//! winners.
 //!
-//! Records are versioned: a key may have many entries at different HLCs. Resolution is **LWW-at-read
-//! by descending HLC** — the reader picks the highest-HLC entry, so re-injecting a
-//! lower-HLC message next to a higher one still reads back the higher. This is why rebase re-injection
-//! is correct without idempotence.
+//! **Ascent** is byte-accounted. A transient builder that exceeds either regular-buffer capacity routes
+//! its messages by the current pivots, flushes the child owning the most pending *encoded bytes*, and
+//! integrates whatever ordered replacement run the child returns — splicing the parent *wider* rather
+//! than nesting temporary two-child internal nodes. An overfull internal builder partitions into
+//! contiguous groups and partitions its buffer at every promoted pivot, because every message for key
+//! `k` must remain on `k`'s root-to-leaf path.
+//!
+//! Nothing here is confluent: canonical encoding gives one byte string per logical *node*, not one tree
+//! shape per resolved key/value set. Different operation orders may produce different roots for
+//! observably equal maps, and `tests/model.rs` asserts exactly that distinction.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
-use crate::store::{NodeStore, StagedNode};
-use crate::{AccessHint, BTreeMessage, BlockId, Hlc, MessageOp, TreeError};
-use async_trait::async_trait;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 
-/// Hot-path node maps are keyed by `BlockId` (already a blake3 hash) — foldhash beats SipHash on
-/// every descent probe with zero DoS exposure (keys are content hashes, not attacker-chosen).
-type NodeMap = foldhash::HashMap<BlockId, Arc<Node>>;
+use crate::MetricsSnapshot;
+use crate::cache::ObjectCache;
+use crate::codec::{self, Entry, NodeView};
+use crate::format::Format;
+use crate::inflight::Inflight;
+use crate::metrics::Metrics;
+use crate::store::{AddressedObject, NodeStore};
+use crate::value;
+use crate::{
+    AccessHint, BlockId, BudgetState, CapacityError, DecodeError, Mutation, MutationOp, TreeError,
+    VersionStamp, Winner, WinnerOp, WorkBudget,
+};
 
-/// Accumulates a write walk's new nodes so ONE commit's tree rewrite flushes as a single packed
-/// `put_batch` instead of one write per node. Staging is pure: `BlockId::of` is blake3 (no I/O), so
-/// a parent references a freshly-staged child by id before that child is durable — the whole batch
-/// lands together at the `tree_put` boundary, before anything names the new root — a root is only
-/// ever published once every node it reaches is durable. Tree nodes are reachability-governed:
-/// retained until nothing references them.
+/// Whether a cache miss rehashes fetched bytes before decoding them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerifyPolicy {
+    /// Hash every fetched byte string and compare it with the requested `BlockId` before decoding.
+    /// Hashing arbitrary bytes is safe; decode validation still establishes well-formedness.
+    #[default]
+    Always,
+    /// Rely on the [`NodeStore`]'s own content-addressing contract.
+    Never,
+}
+
+type Fut<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, TreeError>> + Send + 'a>>;
+
+/// Objects one cursor lookahead may fetch. At the selected 64 KiB node size this bounds speculative
+/// prefetch to about 4 MiB, which is the memory a scan trades for batched reads. On the selected
+/// 100k-key fixture, width 64 cuts a full scan from 162 to 11 waves; width 256 spends 4x the lookahead
+/// memory to reach 6, so 64 is the measured default knee rather than a hidden universal constant.
+pub const DEFAULT_PREFETCH_WIDTH: usize = 64;
+
+/// The ordered replacement run one recursive write produced. `following` is empty for a stable
+/// one-node rewrite; a binary `Split` would be insufficient because a large flushed batch can split one
+/// child into more than two regular nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Rewrite {
+    first: BlockId,
+    /// `(minimum key of that node, its id)`, in key order.
+    following: Vec<(Bytes, BlockId)>,
+    /// The tree level every node in this run sits at.
+    level: u16,
+}
+
+impl Rewrite {
+    fn single(id: BlockId, level: u16) -> Rewrite {
+        Rewrite {
+            first: id,
+            following: Vec::new(),
+            level,
+        }
+    }
+    fn ids(&self) -> Vec<BlockId> {
+        std::iter::once(self.first)
+            .chain(self.following.iter().map(|(_, id)| *id))
+            .collect()
+    }
+}
+
+/// One transient internal node. Keeping its coupled columns together makes the cardinality invariant
+/// (`children = pivots + 1`) visible at every flush, splice, and partition boundary.
+struct InternalBuilder {
+    level: u16,
+    children: Vec<BlockId>,
+    pivots: Vec<Bytes>,
+    buffer: Vec<Entry>,
+    direct: Vec<Entry>,
+}
+
+impl InternalBuilder {
+    fn needs_partition(&self, fmt: &Format) -> bool {
+        self.children.len() > fmt.f_max() || !fmt.pivots_fit(&self.pivots)
+    }
+
+    /// Replace one child with an ordered rewrite run, widening this node when the child split.
+    fn splice(&mut self, at: usize, rewrite: Rewrite) {
+        self.children[at] = rewrite.first;
+        for (offset, (min_key, id)) in rewrite.following.into_iter().enumerate() {
+            self.pivots.insert(at + offset, min_key);
+            self.children.insert(at + 1 + offset, id);
+        }
+        debug_assert_eq!(self.children.len(), self.pivots.len() + 1);
+    }
+}
+
+/// Exactly the staged objects reachable from the proposed root.
+struct Reachable {
+    nodes: foldhash::HashSet<BlockId>,
+    values: foldhash::HashSet<BlockId>,
+    decoded_nodes: Vec<(BlockId, Arc<NodeView>)>,
+}
+
+/// Accumulates one apply's new objects so the whole rewrite lands as a single addressed `put_batch`.
+/// Staging is pure — `BlockId::of` is BLAKE3, no I/O — so a parent can reference a freshly staged child
+/// by id before that child is durable. The batch lands before anything names the new root.
 #[derive(Default)]
 struct Staged {
-    nodes: Vec<StagedNode>,
+    objects: Vec<AddressedObject>,
+    /// Ids already staged. Content addressing makes a duplicate submission redundant *and* the tree can
+    /// produce many: one 513-byte value applied to 256 keys is one distinct object, and staging it 256
+    /// times submitted 257 objects and 200 KiB where 2 objects and ~1.5 KiB were new. At the 4 MiB value
+    /// limit the same shape turns one logical value into ~1 GiB of write traffic.
+    seen: foldhash::HashSet<BlockId>,
+    bytes_hashed: u64,
+    /// Nodes staged this apply, so they can warm the decoded cache once the batch is durable.
+    node_bytes: Vec<(BlockId, Bytes)>,
+    /// Distinct value payloads staged this apply, so read-after-write does not fetch bytes the caller
+    /// just supplied. Inserted only after the addressed batch is durable.
+    value_payloads: Vec<(BlockId, Bytes)>,
+    duplicates_elided: u64,
 }
 
 impl Staged {
-    /// Serialize a node, compute its content id, and stage its bytes (no I/O). Returns the id so a
-    /// parent can reference it immediately.
-    fn stage(&mut self, node: &Node) -> Result<BlockId, TreeError> {
-        let bytes = postcard::to_stdvec(node).map_err(|e| TreeError::Codec(e.to_string()))?;
+    /// Stage one node whose id a parent needs immediately.
+    fn one(&mut self, bytes: Bytes) -> BlockId {
         let id = BlockId::of(&bytes);
-        self.nodes.push(StagedNode(Bytes::from(bytes))); // reachability-governed, never expiring
+        self.bytes_hashed += bytes.len() as u64;
+        if self.insert(id, bytes.clone()) {
+            self.node_bytes.push((id, bytes));
+        }
+        id
+    }
+
+    /// Stage an object whose id is **already known**, without hashing it again. `value::encode` has to
+    /// hash to address the object; re-hashing the same bytes here was pure duplicated work.
+    fn value(&mut self, obj: &value::ValueObject) {
+        if self.insert(obj.id, obj.bytes.clone()) {
+            // Share the canonical object's allocation with the value cache. Retaining the caller's
+            // original `Bytes` here would keep a second full allocation alive through publication.
+            self.value_payloads
+                .push((obj.id, obj.bytes.slice(value::ENVELOPE_BYTES..)));
+        }
+    }
+
+    /// `true` when this id was newly staged.
+    fn insert(&mut self, id: BlockId, bytes: Bytes) -> bool {
+        if !self.seen.insert(id) {
+            self.duplicates_elided += 1;
+            return false;
+        }
+        self.objects.push(AddressedObject { id, bytes });
+        true
+    }
+
+    /// Stage a whole topological layer of independent nodes.
+    fn layer(&mut self, layer: Vec<Bytes>) -> Vec<BlockId> {
+        let ids: Vec<BlockId> = layer.iter().map(|bytes| BlockId::of(bytes)).collect();
+        for (id, bytes) in ids.iter().zip(layer) {
+            self.bytes_hashed += bytes.len() as u64;
+            if self.insert(*id, bytes.clone()) {
+                self.node_bytes.push((*id, bytes));
+            }
+        }
+        ids
+    }
+
+    /// Reachability inside this apply's staged node DAG. A normalized external value may lose to an
+    /// existing winner, and a transient node may be replaced before publication; neither belongs in
+    /// the durable batch. Old child ids are absent from `node_bytes` and are already durable by the
+    /// input-root contract.
+    fn reachable(&self, fmt: &Arc<Format>, root: BlockId) -> Result<Reachable, TreeError> {
+        let nodes: foldhash::HashMap<BlockId, &Bytes> = self
+            .node_bytes
+            .iter()
+            .map(|(id, bytes)| (*id, bytes))
+            .collect();
+        let mut reachable_nodes = foldhash::HashSet::default();
+        let mut reachable_values = foldhash::HashSet::default();
+        let mut decoded = Vec::new();
+        let mut pending = vec![root];
+        while let Some(id) = pending.pop() {
+            let Some(bytes) = nodes.get(&id) else {
+                continue;
+            };
+            if !reachable_nodes.insert(id) {
+                continue;
+            }
+            let view = NodeView::decode(fmt, Some(id), (*bytes).clone())?;
+            for (kind, referenced) in view.references() {
+                match kind {
+                    crate::ObjectKind::Node => pending.push(referenced),
+                    crate::ObjectKind::Value => {
+                        reachable_values.insert(referenced);
+                    }
+                }
+            }
+            decoded.push((id, Arc::new(view)));
+        }
+        Ok(Reachable {
+            nodes: reachable_nodes,
+            values: reachable_values,
+            decoded_nodes: decoded,
+        })
+    }
+}
+
+/// The buffered tree over any [`NodeStore`]. `&self` throughout: shared as `Arc<BeTree<_>>`.
+pub struct BeTree<S: NodeStore> {
+    store: Arc<S>,
+    fmt: Arc<Format>,
+    class: S::Class,
+    verify: VerifyPolicy,
+    budget: WorkBudget,
+    /// Decoded-node cache. A node is immutable content-addressed bytes, so a cached decode is coherent
+    /// forever — zero invalidation, eviction is pure capacity. Weighted by the retained byte string.
+    cache: ObjectCache<Arc<NodeView>>,
+    /// Out-of-line value cache, keyed by the value object's id. Values were excluded from caching
+    /// entirely, so three reads of one external value fetched it three times.
+    values: ObjectCache<Bytes>,
+    node_flights: Arc<Inflight<Arc<NodeView>>>,
+    value_flights: Arc<Inflight<Bytes>>,
+    metrics: Arc<Metrics>,
+    resolve_scratch: Arc<Mutex<Vec<ResolveScratch>>>,
+    wave_scratch: Arc<Mutex<Vec<WaveScratch>>>,
+    materialize_scratch: Arc<Mutex<Vec<MaterializeScratch>>>,
+}
+
+#[derive(Default)]
+struct ResolveScratch {
+    best: Vec<Option<Winner>>,
+    frontier: Vec<(usize, BlockId, u16)>,
+    ids: Vec<BlockId>,
+    next: Vec<(usize, BlockId, u16)>,
+}
+
+#[derive(Default)]
+struct MaterializeScratch {
+    refs: Vec<(BlockId, u32)>,
+    slots: Vec<Option<usize>>,
+    index: foldhash::HashMap<BlockId, usize>,
+    out: Vec<Option<Bytes>>,
+    cached: Vec<Option<Bytes>>,
+    missing: Vec<(BlockId, u32)>,
+}
+
+#[derive(Default)]
+struct Wave {
+    entries: Vec<(BlockId, Arc<NodeView>)>,
+}
+
+impl Wave {
+    fn get(&self, id: &BlockId) -> Option<&Arc<NodeView>> {
+        match self
+            .entries
+            .binary_search_by_key(id, |(entry_id, _)| *entry_id)
+        {
+            Ok(idx) => Some(&self.entries[idx].1),
+            Err(_) => None,
+        }
+    }
+
+    fn into_values(self) -> impl Iterator<Item = Arc<NodeView>> {
+        self.entries.into_iter().map(|(_, view)| view)
+    }
+}
+
+#[derive(Default)]
+struct WaveScratch {
+    ids: Vec<BlockId>,
+    entries: Vec<(BlockId, Arc<NodeView>)>,
+    misses: Vec<BlockId>,
+    fetch: Vec<BlockId>,
+}
+
+impl WaveScratch {
+    fn reset(&mut self) {
+        self.ids.clear();
+        self.entries.clear();
+        self.misses.clear();
+        self.fetch.clear();
+    }
+}
+
+impl MaterializeScratch {
+    fn reset(&mut self, keys_len: usize) {
+        self.refs.clear();
+        self.slots.clear();
+        self.index.clear();
+        self.out.clear();
+        self.cached.clear();
+        self.missing.clear();
+        self.slots.resize(keys_len, None);
+        self.out.reserve(keys_len);
+        self.cached.reserve(keys_len);
+        self.missing.reserve(keys_len);
+    }
+}
+
+impl ResolveScratch {
+    fn reset(&mut self, keys_len: usize) {
+        self.best.clear();
+        self.best.resize(keys_len, None);
+        self.frontier.clear();
+        self.ids.clear();
+        self.next.clear();
+    }
+}
+
+/// Result of an offline canonical rewrite. The old root remains valid and untouched; the new root is
+/// published only through the returned id after every target batch is durable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    pub source_schema: crate::format::SchemaId,
+    pub target_schema: crate::format::SchemaId,
+    pub old_root: BlockId,
+    pub new_root: BlockId,
+    pub rows: u64,
+    pub apply_batches: u64,
+}
+
+/// Cache sizing. Hard-coding 512 MiB of nodes and no value cache at all is not a defensible universal
+/// policy — an embedded host may have a total budget smaller than that default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheConfig {
+    /// Weight budget for decoded nodes, in bytes.
+    pub node_bytes: u64,
+    /// Weight budget for out-of-line value payloads, in bytes.
+    pub value_bytes: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        CacheConfig {
+            node_bytes: 64 << 20,
+            value_bytes: 16 << 20,
+        }
+    }
+}
+
+impl CacheConfig {
+    /// Caching disabled entirely, for a host that does its own.
+    pub const NONE: CacheConfig = CacheConfig {
+        node_bytes: 0,
+        value_bytes: 0,
+    };
+}
+
+/// Weight of a cached view: the actual retained byte-string length plus fixed view metadata, with a
+/// saturating conversion into moka's weight type.
+fn view_weight(v: &Arc<NodeView>) -> u32 {
+    const VIEW_OVERHEAD: usize = std::mem::size_of::<NodeView>();
+    v.bytes()
+        .len()
+        .saturating_add(v.materialized_key_bytes())
+        .saturating_add(VIEW_OVERHEAD)
+        .min(u32::MAX as usize) as u32
+}
+
+impl<S: NodeStore> BeTree<S> {
+    pub fn new(store: Arc<S>) -> Self {
+        Self::with_format(store, Format::selected())
+    }
+
+    /// Open a root whose schema is in the released-format registry. The envelope is used only to pick
+    /// a decoder; the root hash and every canonical invariant are then verified normally.
+    pub async fn open_known(store: Arc<S>, root: BlockId) -> Result<Self, TreeError> {
+        let max = Format::known_schemas()
+            .map(|format| format.max_object_bytes())
+            .max()
+            .expect("registry is nonempty");
+        let bytes = store.get(root, AccessHint::Random, max).await?;
+        let actual = BlockId::of(&bytes);
+        if actual != root {
+            return Err(TreeError::HashMismatch {
+                requested: root,
+                actual,
+            });
+        }
+        let schema = codec::declared_schema(&bytes)?;
+        let format = Format::known_schema(&schema).ok_or_else(|| {
+            TreeError::decode(
+                Some(root),
+                DecodeError::SchemaId {
+                    found: schema.iter().map(|byte| format!("{byte:02x}")).collect(),
+                    expected: "a schema in Format::known_schema".into(),
+                },
+            )
+        })?;
+        let tree = BeTree::with_format(store, format);
+        let view = Arc::new(NodeView::decode(&tree.fmt, Some(root), bytes)?);
+        tree.cache.insert(root, view).await;
+        Ok(tree)
+    }
+
+    pub fn with_format(store: Arc<S>, fmt: Format) -> Self {
+        let fmt = Arc::new(fmt);
+        BeTree {
+            store,
+            fmt,
+            class: S::Class::default(),
+            verify: VerifyPolicy::default(),
+            budget: WorkBudget::default(),
+            cache: ObjectCache::new(CacheConfig::default().node_bytes, |_id, view| {
+                view_weight(view)
+            }),
+            values: ObjectCache::new(CacheConfig::default().value_bytes, |_id, value: &Bytes| {
+                value.len().min(u32::MAX as usize) as u32
+            }),
+            node_flights: Arc::new(Inflight::default()),
+            value_flights: Arc::new(Inflight::default()),
+            metrics: Arc::new(Metrics::default()),
+            resolve_scratch: Arc::new(Mutex::new(Vec::new())),
+            wave_scratch: Arc::new(Mutex::new(Vec::new())),
+            materialize_scratch: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Size both caches. Zero disables one.
+    pub fn with_caches(mut self, cfg: CacheConfig) -> Self {
+        self.cache = ObjectCache::new(cfg.node_bytes, |_id, view| view_weight(view));
+        self.values = ObjectCache::new(cfg.value_bytes, |_id, value: &Bytes| {
+            value.len().min(u32::MAX as usize) as u32
+        });
+        self
+    }
+
+    pub fn with_verify(mut self, verify: VerifyPolicy) -> Self {
+        self.verify = verify;
+        self
+    }
+    pub fn with_budget(mut self, budget: WorkBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+    /// Enable lock-free workload counters. Recording is off by default.
+    pub fn record_metrics(mut self) -> Self {
+        self.metrics = Arc::new(Metrics::recording());
+        self
+    }
+
+    /// A cheap class-scoped view sharing the store, format, cache, and metrics.
+    pub fn for_class(&self, class: S::Class) -> Self {
+        BeTree {
+            store: self.store.clone(),
+            fmt: self.fmt.clone(),
+            class,
+            verify: self.verify,
+            budget: self.budget,
+            cache: self.cache.clone(),
+            values: self.values.clone(),
+            node_flights: self.node_flights.clone(),
+            value_flights: self.value_flights.clone(),
+            metrics: self.metrics.clone(),
+            resolve_scratch: self.resolve_scratch.clone(),
+            wave_scratch: self.wave_scratch.clone(),
+            materialize_scratch: self.materialize_scratch.clone(),
+        }
+    }
+
+    pub fn format(&self) -> &Format {
+        &self.fmt
+    }
+    /// Read the optional workload counters without exposing their synchronization machinery.
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Return the canonical root of an empty tree.
+    pub async fn empty_root(&self) -> Result<BlockId, TreeError> {
+        let bytes = codec::encode_leaf(&self.fmt, &[])?;
+        let id = BlockId::of(&bytes);
+        let view = Arc::new(NodeView::decode(&self.fmt, Some(id), bytes.clone())?);
+        self.store
+            .put_batch(vec![AddressedObject { id, bytes }], self.class)
+            .await?;
+        self.warm_cache(vec![(id, view)]).await;
         Ok(id)
     }
-}
 
-/// One versioned entry for a key. Entries for a key are kept newest-first (descending HLC) so a point
-/// read returns the current state from the first slot without scanning history.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Entry {
-    key: Vec<u8>,
-    hlc: Hlc,
-    op: MessageOp,
-}
-
-/// A tree node: either a leaf (sorted versioned entries) or an interior node (pivots + child BlockIds
-/// + a message buffer). Serialized with postcard deterministically ⇒ its BlockId is content-stable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum Node {
-    Leaf {
-        entries: Vec<Entry>, // sorted by (key asc, hlc desc)
-    },
-    Internal {
-        pivots: Vec<Vec<u8>>, // pivots[i] = min key of children[i+1]; len = children.len()-1
-        children: Vec<BlockId>, // child roots
-        buffer: Vec<Entry>,   // messages absorbed here, not yet flushed; sorted like a leaf
-    },
-}
-
-/// A leaf splits when it exceeds this many entries; an interior buffer flushes when it exceeds it.
-/// Small so tests exercise splits/flushes; a real deployment tunes it (impl §11 flagged knob).
-const FANOUT: usize = 64;
-
-/// The Bε-tree over any [`NodeStore`]. `&self` + the store's internal locks — `Arc<MemTree>` shared.
-pub struct MemTree<S: NodeStore> {
-    blocks: Arc<S>,
-    /// Retention floor: on a write that rewrites a leaf, per-key versions strictly below this HLC are
-    /// dropped (keeping each key's winner). `ZERO` = keep-all (default). Set it to the oldest HLC any
-    /// live branch or snapshot can still read, so compaction never drops a reachable version.
-    floor: Hlc,
-    /// The store's write class for this tree's nodes — the host's own vocabulary, never interpreted
-    /// here. Defaults to `Class::default()`; derive a class-scoped view with `for_class` so a commit's
-    /// tree nodes are written at the same class as the data they index.
-    class: S::Class,
-    /// Decoded-node cache: `BlockId → Arc<Node>`. A node is immutable content-addressed bytes, so a
-    /// cached decode is coherent FOREVER — zero invalidation, eviction is pure capacity. Shared across
-    /// the class/floor views derived by `for_class`, so a walk decodes each node ONCE rather than once
-    /// per view. Weight-bounded by decoded bytes.
-    cache: moka::future::Cache<BlockId, Arc<Node>>,
-}
-
-/// Approximate decoded footprint of a node, for the cache weigher (bounds memory: data leaves are large,
-/// a count-bounded cache would not). Cheap: sums key + value lengths, no re-encode.
-fn node_weight(n: &Node) -> u32 {
-    let entry = |e: &Entry| -> usize {
-        e.key.len()
-            + match &e.op {
-                MessageOp::Upsert(v) => v.len(),
-                MessageOp::Tombstone => 0,
-            }
-            + 24 // hlc + per-entry overhead
-    };
-    let bytes = match n {
-        Node::Leaf { entries } => entries.iter().map(entry).sum::<usize>(),
-        Node::Internal {
-            pivots,
-            children,
-            buffer,
-        } => {
-            pivots.iter().map(|p| p.len()).sum::<usize>()
-                + children.len() * 32
-                + buffer.iter().map(entry).sum::<usize>()
-        }
-    };
-    bytes.min(u32::MAX as usize) as u32
-}
-
-/// A fresh decoded-node cache. Weight-bounded (decoded bytes) so data-heavy leaves can't blow memory.
-fn new_node_cache() -> moka::future::Cache<BlockId, Arc<Node>> {
-    moka::future::Cache::builder()
-        .max_capacity(512 << 20) // 512 MiB of decoded nodes
-        .weigher(|_id: &BlockId, node: &Arc<Node>| node_weight(node))
-        .build()
-}
-
-/// The content-addressed COW Bε-tree contract. `tree_put` NEVER mutates — it returns a NEW root,
-/// which is what makes a snapshot free. Merkle by construction: a node's identity IS its hash.
-#[async_trait]
-pub trait Tree: Send + Sync {
-    /// Create an empty tree; returns the root BlockId of an empty leaf.
-    async fn empty_root(&self) -> Result<BlockId, TreeError>;
-    /// Inject messages at the root, flushing lazily; returns the NEW root BlockId.
-    async fn tree_put(&self, root: BlockId, msgs: Vec<BTreeMessage>) -> Result<BlockId, TreeError>;
-    /// Point read with LWW-at-read (descending-HLC). None if absent or the winner is a tombstone.
-    async fn tree_get(&self, root: BlockId, key: &[u8]) -> Result<Option<Vec<u8>>, TreeError>;
-    /// BATCHED point read: resolve MANY keys under `root` in O(tree-depth) `get_many` waves, decoding
-    /// each covering node ONCE — vs one full re-decoding root→leaf walk per key. Results align to
-    /// `keys`. This is what makes reassembling a chunked file (hundreds of hash-scattered chunk keys)
-    /// cost O(depth waves + nodes-touched), not O(keys × node-decode) — the fix for whole-file reads.
-    /// Default: sequential `tree_get` (correct but O(keys × walk)); `MemTree` overrides with the wave.
-    async fn tree_get_many(
+    /// Apply one stamped batch and return a new root without mutating the old snapshot.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub async fn apply(
         &self,
         root: BlockId,
-        keys: &[&[u8]],
-    ) -> Result<Vec<Option<Vec<u8>>>, TreeError> {
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys {
-            out.push(self.tree_get(root, k).await?);
-        }
-        Ok(out)
-    }
-    /// O(divergence) diff: keys whose resolved value differs between two roots. Identical subtrees
-    /// (equal BlockId) are skipped with zero I/O.
-    async fn diff(&self, a: BlockId, b: BlockId) -> Result<Vec<Vec<u8>>, TreeError>;
-    /// Range scan: all live `(key, value)` pairs whose key starts with `prefix`, in key order, with
-    /// LWW-at-read resolution (tombstoned keys excluded). This is the primitive adjacency lookups and
-    /// directory listings ride on — a neighbour lookup is a prefix scan. Empty `prefix` scans the
-    /// whole tree.
-    async fn scan_prefix(
-        &self,
-        root: BlockId,
-        prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError>;
-
-    /// **Batched multi-prefix scan.** Resolve MANY
-    /// prefixes in ONE tree walk that SHARES covering internal nodes — one `load_wave` per LEVEL across the
-    /// whole set, not one descent per prefix. This is what a multi-hop traversal's frontier expansion needs:
-    /// N sources expand in a single batched descent (covering nodes deduped + cache-checked once), instead
-    /// of N independent throttled scans. Returns one live `(key,value)` list per input prefix, in input
-    /// order. Default: sequential `scan_prefix` (correct, O(prefixes × walk)); `MemTree` overrides with the
-    /// single shared walk.
-    async fn scan_prefix_many(
-        &self,
-        root: BlockId,
-        prefixes: &[&[u8]],
-    ) -> Result<Vec<Vec<(Vec<u8>, Vec<u8>)>>, TreeError> {
-        let mut out = Vec::with_capacity(prefixes.len());
-        for p in prefixes {
-            out.push(self.scan_prefix(root, p).await?);
-        }
-        Ok(out)
-    }
-
-    /// Half-open range scan `[lo, hi)` (either bound `None` = unbounded), in key order, LWW-resolved,
-    /// tombstones excluded. Prunes any subtree whose key range is disjoint from `[lo, hi)`, so a narrow
-    /// window touches O(window + path) — an open lower bound a prefix scan cannot express, giving
-    /// O(window) tailing rather than O(corpus).
-    async fn scan_range(
-        &self,
-        root: BlockId,
-        lo: Option<&[u8]>,
-        hi: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError>;
-}
-
-impl<S: NodeStore> MemTree<S> {
-    pub fn new(blocks: Arc<S>) -> Self {
-        MemTree {
-            blocks,
-            floor: Hlc::ZERO,
-            class: S::Class::default(),
-            cache: new_node_cache(),
-        }
-    }
-
-    /// Construct with a retention floor: leaf rewrites drop per-key versions below it (keeping each
-    /// key's winner). Pass the oldest HLC any live branch or snapshot can still read, so compaction
-    /// is bounded by what remains reachable.
-    pub fn with_floor(blocks: Arc<S>, floor: Hlc) -> Self {
-        MemTree {
-            blocks,
-            floor,
-            class: S::Class::default(),
-            cache: new_node_cache(),
-        }
-    }
-
-    /// A cheap class-scoped view of this tree (shares the same store + floor + decoded-node cache):
-    /// node writes land at `class` instead of the default. Derive one per commit so a commit's tree
-    /// nodes are written as durably as the data they index — the class must reach the block writes.
-    /// The cache is SHARED (immutable nodes ⇒ coherent across views).
-    pub fn for_class(&self, class: S::Class) -> Self {
-        MemTree {
-            blocks: self.blocks.clone(),
-            floor: self.floor,
-            class,
-            cache: self.cache.clone(),
-        }
-    }
-
-    /// Load + decode one node, returning a SHARED `Arc<Node>`. Served from the decoded-node cache on
-    /// hit (no fetch, no re-decode); on miss the bytes fault through to the store and are cached. Shared
-    /// (not cloned) so a data-heavy leaf is decoded at most once regardless of how many keys touch it.
-    async fn load(&self, id: BlockId) -> Result<Arc<Node>, TreeError> {
-        if let Some(node) = self.cache.get(&id).await {
-            return Ok(node);
-        }
-        let bytes = self.blocks.get(id, AccessHint::Random).await?;
-        let node: Node =
-            postcard::from_bytes(&bytes).map_err(|e| TreeError::Decode(id, e.to_string()))?;
-        let node = Arc::new(node);
-        self.cache.insert(id, node.clone()).await;
-        Ok(node)
-    }
-
-    /// Load a whole frontier in ONE `get_many` wave — query cost is the DEPTH of dependent fetch
-    /// waves, not the fetch count. Cache hits are skipped from the wave entirely; only true misses fetch.
-    /// Input ids are deduped (content-addressing can share a subtree — e.g. the empty leaf — under one
-    /// root); returns a shared decoded node for each id.
-    async fn load_wave(&self, ids: &[BlockId]) -> Result<NodeMap, TreeError> {
-        let mut out = NodeMap::with_capacity_and_hasher(ids.len(), Default::default());
-        let mut misses: Vec<BlockId> = Vec::new();
-        {
-            let mut seen: foldhash::HashSet<BlockId> = Default::default();
-            for id in ids.iter().copied().filter(|id| seen.insert(*id)) {
-                match self.cache.get(&id).await {
-                    Some(node) => {
-                        out.insert(id, node);
-                    }
-                    None => misses.push(id),
-                }
-            }
-        }
-        if !misses.is_empty() {
-            let fetched = self.blocks.get_many(&misses, AccessHint::Random).await;
-            for (id, res) in misses.into_iter().zip(fetched) {
-                let bytes = res?;
-                let node: Node = postcard::from_bytes(&bytes)
-                    .map_err(|e| TreeError::Decode(id, e.to_string()))?;
-                let node = Arc::new(node);
-                self.cache.insert(id, node.clone()).await;
-                out.insert(id, node);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Fetch the (pruned) subtree under `root` into memory as BFS `get_many` waves — one wave per
-    /// tree level, so round-trip depth is O(tree depth) instead of O(nodes touched). `descend`
-    /// decides which children of an internal node to enqueue (the range/prefix pruning hook).
-    /// The caller then walks the returned map SYNCHRONOUSLY in the original recursion order, so
-    /// order-sensitive folds (`merge_into`'s children-then-buffer tie-break) are preserved exactly.
-    async fn fetch_pruned(
-        &self,
-        root: BlockId,
-        descend: impl Fn(&[Vec<u8>], usize) -> bool,
-    ) -> Result<NodeMap, TreeError> {
-        self.fetch_pruned_multi(std::slice::from_ref(&root), descend)
-            .await
-    }
-
-    /// `fetch_pruned` seeded from MANY roots at once: every tree's frontier advances in the SAME BFS
-    /// wave, so the whole fan-out costs O(max tree depth) waves, not O(roots × depth).
-    /// Content-addressing dedups nodes shared across roots.
-    async fn fetch_pruned_multi(
-        &self,
-        roots: &[BlockId],
-        descend: impl Fn(&[Vec<u8>], usize) -> bool,
-    ) -> Result<NodeMap, TreeError> {
-        let mut nodes = NodeMap::default();
-        let mut frontier = roots.to_vec();
-        while !frontier.is_empty() {
-            let wave = self.load_wave(&frontier).await?;
-            frontier.clear();
-            for (id, node) in wave {
-                if let Node::Internal {
-                    pivots, children, ..
-                } = node.as_ref()
-                {
-                    for (i, child) in children.iter().enumerate() {
-                        if descend(pivots, i) && !nodes.contains_key(child) {
-                            frontier.push(*child);
-                        }
-                    }
-                }
-                nodes.insert(id, node);
-            }
-        }
-        Ok(nodes)
-    }
-
-    async fn store(&self, node: &Node) -> Result<BlockId, TreeError> {
-        let bytes = postcard::to_stdvec(node).map_err(|e| TreeError::Codec(e.to_string()))?;
-        self.blocks.put(bytes.into(), self.class).await
-    }
-
-    /// Land a write walk's staged nodes as ONE packed batch. Durable on return. Empty staging
-    /// (no nodes produced) is a no-op. The batch's block ids match what `stage` computed, so the parent
-    /// references stay valid; content-addressing makes the pack PUT idempotent on a re-driven commit.
-    async fn flush(&self, staged: Staged) -> Result<(), TreeError> {
-        if staged.nodes.is_empty() {
-            return Ok(());
-        }
-        self.blocks.put_batch(staged.nodes, self.class).await?;
-        Ok(())
-    }
-
-    /// The child BlockIds a tree node directly references (empty for a leaf). Lets a garbage collector
-    /// walk the tree's Merkle DAG for reachability marking without knowing the node layout.
-    pub async fn child_blocks(&self, node: BlockId) -> Result<Vec<BlockId>, TreeError> {
-        match self.load(node).await?.as_ref() {
-            Node::Leaf { .. } => Ok(Vec::new()),
-            Node::Internal { children, .. } => Ok(children.clone()),
-        }
-    }
-
-    /// `child_blocks` over a whole frontier in ONE `get_many` wave — the GC mark walks a level per
-    /// round-trip instead of a node per round-trip. Duplicates in `nodes` are fetched
-    /// once; the returned child list is the concatenation over DISTINCT input nodes.
-    pub async fn child_blocks_many(&self, nodes: &[BlockId]) -> Result<Vec<BlockId>, TreeError> {
-        let wave = self.load_wave(nodes).await?;
-        Ok(wave
-            .into_values()
-            .flat_map(|n| match n.as_ref() {
-                Node::Leaf { .. } => Vec::new(),
-                Node::Internal { children, .. } => children.clone(),
-            })
-            .collect())
-    }
-}
-
-/// Merge `msgs` into `dst`, keeping the (key asc, hlc desc) invariant and collapsing duplicate
-/// `(key, hlc)` pairs to ONE. Which duplicate survives is load-bearing: a caller stamps *every* message
-/// in a single commit with the SAME HLC (`Hlc::advance_past` advances only BETWEEN commits), so two
-/// writes to one key in one commit collide on `(key, hlc)`. The LAST-queued message must win —
-/// program order is caller intent, so an upsert-then-tombstone in one commit deletes, not resurrects
-/// program order. `msgs` are appended after `dst` (they're the newer write), and the
-/// explicit position tiebreak (later index first) makes `dedup_by` — which keeps the first of each run
-/// — keep the last-queued entry. A re-injected (rebase) duplicate is byte-identical, so either wins.
-fn merge_entries(dst: &mut Vec<Entry>, msgs: Vec<Entry>) {
-    dst.extend(msgs);
-    let mut tagged: Vec<(usize, Entry)> = std::mem::take(dst).into_iter().enumerate().collect();
-    // key asc, hlc desc, then LATER original position first — so the surviving (first-of-run) entry is
-    // the last-queued one.
-    tagged.sort_by(|(ia, a), (ib, b)| {
-        a.key
-            .cmp(&b.key)
-            .then_with(|| b.hlc.cmp(&a.hlc))
-            .then_with(|| ib.cmp(ia))
-    });
-    let mut out: Vec<Entry> = tagged.into_iter().map(|(_, e)| e).collect();
-    out.dedup_by(|a, b| a.key == b.key && a.hlc == b.hlc);
-    *dst = out;
-}
-
-/// Drop per-key versions below the retention `floor`, bounding unbounded history growth for hot keys
-/// (see the `split_leaf` note). `entries` is sorted (key asc, hlc desc), so per key the FIRST entry
-/// is the current (highest-HLC) winner.
-///
-/// Read-preserving by construction — safe because reads are LWW-at-read (the winner) and there is no
-/// AS-OF read below the floor (a floor is exactly the horizon below which no snapshot can branch):
-/// for each key keep every version with `hlc >= floor`, AND always keep the winner even if it
-/// is itself below the floor (a rarely-updated key whose only version predates the floor must survive,
-/// never resolve to absent). `floor == Hlc::ZERO` keeps everything (the default — current behavior,
-/// full time-travel headroom).
-fn compact_below_floor(entries: &mut Vec<Entry>, floor: Hlc) {
-    if floor == Hlc::ZERO {
-        return; // keep-all fast path
-    }
-    let mut prev_key: Option<Vec<u8>> = None;
-    entries.retain(|e| {
-        let is_winner = prev_key.as_deref() != Some(e.key.as_slice());
-        prev_key = Some(e.key.clone());
-        is_winner || e.hlc >= floor // winner (first per key) always kept; others only at/above floor
-    });
-}
-
-/// Resolve a key from a set of entries (already newest-first): the first matching entry wins (LWW).
-fn resolve<'a>(entries: &'a [Entry], key: &[u8]) -> Option<&'a Entry> {
-    entries.iter().find(|e| e.key == key)
-}
-
-impl<S: NodeStore> MemTree<S> {
-    /// Which child index owns `key` given `pivots` (pivots[i] = min key of child i+1).
-    fn child_of(pivots: &[Vec<u8>], key: &[u8]) -> usize {
-        // First pivot strictly greater than key bounds the child; else the last child.
-        pivots.partition_point(|p| p.as_slice() <= key)
-    }
-
-    async fn put_node(
-        &self,
-        mut buffer: Vec<Entry>,
-        root: BlockId,
-        staged: &mut Staged,
+        stamp: VersionStamp,
+        mutations: Vec<Mutation>,
     ) -> Result<BlockId, TreeError> {
-        let node = self.load(root).await?;
-        // Cached node is shared+immutable; the write path mutates, so clone the fields it rewrites.
-        match node.as_ref() {
-            Node::Leaf { entries } => {
-                let mut entries = entries.clone();
-                merge_entries(&mut entries, buffer);
-                // Compaction: drop per-key versions below the retention floor (keeping each winner).
-                // Bounds a hot key's history; a no-op when floor == ZERO.
-                compact_below_floor(&mut entries, self.floor);
-                if entries.len() <= FANOUT {
-                    return staged.stage(&Node::Leaf { entries });
-                }
-                // Split into two leaves + a parent. Split at a key boundary (never mid-key-version).
-                self.split_leaf(entries, staged)
-            }
-            Node::Internal {
-                pivots,
-                children,
-                buffer: node_buf,
-            } => {
-                let pivots = pivots.clone();
-                let mut children = children.clone();
-                let mut node_buf = node_buf.clone();
-                merge_entries(&mut node_buf, std::mem::take(&mut buffer));
-                if node_buf.len() <= FANOUT {
-                    return staged.stage(&Node::Internal {
-                        pivots,
-                        children,
-                        buffer: node_buf,
-                    });
-                }
-                // Buffer full: flush the heaviest child (Bε lazy flush, impl §11 victim = heaviest).
-                let mut by_child: Vec<Vec<Entry>> = vec![Vec::new(); children.len()];
-                for e in node_buf {
-                    let idx = Self::child_of(&pivots, &e.key);
-                    by_child[idx].push(e);
-                }
-                let heavy = by_child
-                    .iter()
-                    .enumerate()
-                    .max_by_key(|(_, v)| v.len())
-                    .map(|(i, _)| i)
-                    .unwrap();
-                let flushed = std::mem::take(&mut by_child[heavy]);
-                children[heavy] = Box::pin(self.put_node(flushed, children[heavy], staged)).await?;
-                // Non-heavy groups stay in this node's buffer.
-                let remaining: Vec<Entry> = by_child.into_iter().flatten().collect();
-                let mut buf = remaining;
-                buf.sort_by(|a, b| a.key.cmp(&b.key).then(b.hlc.cmp(&a.hlc)));
-                staged.stage(&Node::Internal {
-                    pivots,
-                    children,
-                    buffer: buf,
-                })
-            }
+        if mutations.is_empty() {
+            return Ok(root);
         }
-    }
-
-    /// Split an oversized leaf at a KEY boundary into two child leaves + an internal parent. A key's
-    /// full version history must never straddle the split (LWW resolution and `AS OF` read one leaf
-    /// per key), so the pivot is always an existing distinct key and `key < pivot` keeps every version
-    /// of a key together.
-    ///
-    /// A leaf of a SINGLE distinct key with > FANOUT versions cannot be key-split (there is no
-    /// interior key boundary). We keep it as one leaf rather than manufacture an empty-left child —
-    /// which is what produced the unbounded empty-spine growth (review A8). Per-key version count is
-    /// bounded by COMPACTION (`compact_below_floor`, run on every leaf rewrite before this split when
-    /// the tree has a retention floor), a separate concern from tree fan-out; a hot single key is a
-    /// tall-but-single leaf, never a degenerate spine, and with a floor its history stays bounded.
-    fn split_leaf(&self, entries: Vec<Entry>, staged: &mut Staged) -> Result<BlockId, TreeError> {
-        let mut distinct: Vec<&Vec<u8>> = entries.iter().map(|e| &e.key).collect();
-        distinct.dedup();
-        if distinct.len() < 2 {
-            return staged.stage(&Node::Leaf { entries }); // single key ⇒ can't key-split
-        }
-        // Pivot at the median distinct key; `< pivot` guarantees a non-empty left (distinct[0] sorts
-        // below it) and a non-empty right (pivot itself is present).
-        let pivot = distinct[distinct.len() / 2].clone();
-        let (left, right): (Vec<Entry>, Vec<Entry>) =
-            entries.into_iter().partition(|e| e.key < pivot);
-        let lchild = staged.stage(&Node::Leaf { entries: left })?;
-        let rchild = staged.stage(&Node::Leaf { entries: right })?;
-        staged.stage(&Node::Internal {
-            pivots: vec![pivot],
-            children: vec![lchild, rchild],
-            buffer: Vec::new(),
-        })
-    }
-
-    /// Walk to `key`, collecting the winning entry along the path: an interior buffer may hold a newer
-    /// version than the leaf, so the highest-HLC hit across the whole path wins (LWW-at-read).
-    async fn get_entry(&self, root: BlockId, key: &[u8]) -> Result<Option<Entry>, TreeError> {
-        let mut cur = root;
-        let mut best: Option<Entry> = None;
-        loop {
-            let node = self.load(cur).await?;
-            match node.as_ref() {
-                Node::Leaf { entries } => {
-                    if let Some(e) = resolve(entries, key) {
-                        pick_newer(&mut best, e);
-                    }
-                    return Ok(best);
-                }
-                Node::Internal {
-                    pivots,
-                    children,
-                    buffer,
-                } => {
-                    if let Some(e) = resolve(buffer, key) {
-                        pick_newer(&mut best, e);
-                    }
-                    cur = children[Self::child_of(pivots, key)];
-                }
-            }
-        }
-    }
-
-    /// Batched [`get_entry`]: load every node on ANY wanted key's resolution path in O(depth)
-    /// `get_many` waves (each node decoded ONCE), then resolve each key by walking that in-memory node
-    /// map with the SAME buffer-override/LWW logic as `get_entry`. Results align to `keys`.
-    async fn get_entry_many(
-        &self,
-        root: BlockId,
-        keys: &[&[u8]],
-    ) -> Result<Vec<Option<Entry>>, TreeError> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Keep child `i` iff some wanted key descends into it — so every key's root→leaf path loads.
-        let nodes = self
-            .fetch_pruned(root, |pivots, i| {
-                keys.iter().any(|k| Self::child_of(pivots, k) == i)
-            })
-            .await?;
-
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            let mut cur = root;
-            let mut best: Option<Entry> = None;
-            while let Some(node) = nodes.get(&cur) {
-                match node.as_ref() {
-                    Node::Leaf { entries } => {
-                        if let Some(e) = resolve(entries, key) {
-                            pick_newer(&mut best, e);
-                        }
-                        break;
-                    }
-                    Node::Internal {
-                        pivots,
-                        children,
-                        buffer,
-                    } => {
-                        if let Some(e) = resolve(buffer, key) {
-                            pick_newer(&mut best, e);
-                        }
-                        cur = children[Self::child_of(pivots, key)];
-                    }
-                }
-            }
-            out.push(best);
-        }
-        Ok(out)
-    }
-
-    /// Gather the CANDIDATE keys where trees `a` and `b` might diverge, by aligned lockstep descent
-    /// — the O(divergence) diff. Equal BlockId ⇒ identical subtree ⇒ prune. Two internal nodes with
-    /// equal pivots recurse children pairwise (so shared children prune at their id); a structural
-    /// mismatch (pivots differ, or one side is a leaf) collects both subtrees' keys wholesale (a
-    /// correctness-preserving over-approximation — the caller resolves each candidate exactly). Buffer
-    /// keys are always candidates when the nodes differ.
-    fn candidate_keys<'a>(
-        &'a self,
-        a: BlockId,
-        b: BlockId,
-        out: &'a mut std::collections::BTreeSet<Vec<u8>>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), TreeError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            // BFS over ALIGNED PAIRS, one `get_many` wave per level: round-trip depth is
-            // O(tree depth), not O(divergent nodes). Structural mismatches defer to a wholesale
-            // collect (itself wave-based) after the lockstep walk.
-            let mut pairs: Vec<(BlockId, BlockId)> = vec![(a, b)];
-            let mut wholesale: Vec<BlockId> = Vec::new();
-            while !pairs.is_empty() {
-                let ids: Vec<BlockId> = pairs.iter().flat_map(|(x, y)| [*x, *y]).collect();
-                let wave = self.load_wave(&ids).await?;
-                let mut next: Vec<(BlockId, BlockId)> = Vec::new();
-                for (pa_id, pb_id) in pairs {
-                    match (wave[&pa_id].as_ref(), wave[&pb_id].as_ref()) {
-                        (
-                            Node::Internal {
-                                pivots: pa,
-                                children: ca,
-                                buffer: ba,
-                            },
-                            Node::Internal {
-                                pivots: pb,
-                                children: cb,
-                                buffer: bb,
-                            },
-                        ) if pa == pb => {
-                            // Aligned: same pivots ⇒ children line up 1:1. Equal ids prune.
-                            out.extend(ba.iter().map(|e| e.key.clone()));
-                            out.extend(bb.iter().map(|e| e.key.clone()));
-                            next.extend(
-                                ca.iter()
-                                    .zip(cb)
-                                    .filter(|(ac, bc)| ac != bc)
-                                    .map(|(ac, bc)| (*ac, *bc)),
-                            );
-                        }
-                        _ => {
-                            // Structural change (or leaf vs internal): both subtrees wholesale.
-                            wholesale.push(pa_id);
-                            wholesale.push(pb_id);
-                        }
-                    }
-                }
-                pairs = next;
-            }
-            for root in wholesale {
-                self.collect_keys(root, out).await?;
-            }
-            Ok(())
-        })
-    }
-
-    /// Collect every key reachable from `root` (leaves + interior buffers) — the wholesale arm of
-    /// `candidate_keys` when structure diverges. BFS in `get_many` waves: one round-trip per level
-    /// not one per node. Key ORDER doesn't matter here (the accumulator is a set).
-    fn collect_keys<'a>(
-        &'a self,
-        root: BlockId,
-        out: &'a mut std::collections::BTreeSet<Vec<u8>>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), TreeError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let mut frontier = vec![root];
-            while !frontier.is_empty() {
-                let wave = self.load_wave(&frontier).await?;
-                frontier.clear();
-                for node in wave.into_values() {
-                    match node.as_ref() {
-                        Node::Leaf { entries } => out.extend(entries.iter().map(|e| e.key.clone())),
-                        Node::Internal {
-                            children, buffer, ..
-                        } => {
-                            out.extend(buffer.iter().map(|e| e.key.clone()));
-                            frontier.extend(children.iter().copied());
-                        }
-                    }
-                }
-            }
-            Ok(())
-        })
-    }
-
-    /// Like `collect`, but only entries whose key starts with `prefix`. Prunes an interior child when
-    /// its key range cannot contain the prefix (child `i` covers `[pivots[i-1], pivots[i])`), so a
-    /// narrow prefix touches O(matching subtree + path), not the whole tree.
-    async fn collect_prefix(
-        &self,
-        root: BlockId,
-        prefix: &[u8],
-        acc: &mut std::collections::BTreeMap<Vec<u8>, Entry>,
-    ) -> Result<(), TreeError> {
-        // I/O first: prefetch the pruned subtree in one wave per LEVEL, then fold
-        // synchronously in the original recursion order (children before buffer — the merge_into
-        // tie-break contract).
-        let nodes = self
-            .fetch_pruned(root, |pivots, i| {
-                let lo = i.checked_sub(1).map(|j| pivots[j].as_slice());
-                let hi = pivots.get(i).map(|p| p.as_slice());
-                child_range_may_contain_prefix(lo, hi, prefix)
-            })
-            .await?;
-        fold_prefix(&nodes, root, prefix, acc);
-        Ok(())
-    }
-}
-
-/// Synchronous post-prefetch fold for `collect_prefix` — identical traversal order to the old
-/// recursive form (children in index order, then the interior buffer).
-fn fold_prefix(
-    nodes: &NodeMap,
-    at: BlockId,
-    prefix: &[u8],
-    acc: &mut std::collections::BTreeMap<Vec<u8>, Entry>,
-) {
-    match nodes[&at].as_ref() {
-        Node::Leaf { entries } => {
-            for e in entries {
-                if e.key.starts_with(prefix) {
-                    merge_into(acc, e);
-                }
-            }
-        }
-        Node::Internal {
-            pivots,
-            children,
-            buffer,
-        } => {
-            for (i, child) in children.iter().enumerate() {
-                let lo = i.checked_sub(1).map(|j| pivots[j].as_slice());
-                let hi = pivots.get(i).map(|p| p.as_slice());
-                if child_range_may_contain_prefix(lo, hi, prefix) {
-                    fold_prefix(nodes, *child, prefix, acc);
-                }
-            }
-            for e in buffer {
-                if e.key.starts_with(prefix) {
-                    merge_into(acc, e);
-                }
-            }
-        }
-    }
-}
-
-/// The exclusive successor of a prefix (increment with carry, truncating trailing 0xFF). `None` = the
-/// prefix is all-0xFF ⇒ unbounded above. The upper bound of "every key starting with `prefix`".
-fn prefix_succ(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut hi = prefix.to_vec();
-    for i in (0..hi.len()).rev() {
-        if hi[i] != 0xFF {
-            hi[i] += 1;
-            hi.truncate(i + 1);
-            return Some(hi);
-        }
-    }
-    None
-}
-
-/// Does the child key-range `[lo, hi)` overlap the span `[a, b)` (None = unbounded)? Coarse frontier
-/// descend filter for `scan_prefix_many`: over-including is safe because the per-entry bucketing filters
-/// exactly. O(1) per child (byte-slice compares), so the descend never scales with frontier size.
-fn range_overlaps_span(lo: Option<&[u8]>, hi: Option<&[u8]>, a: &[u8], b: Option<&[u8]>) -> bool {
-    let hi_gt_a = hi.is_none_or(|hi| hi > a);
-    let lo_lt_b = match (lo, b) {
-        (Some(lo), Some(b)) => lo < b,
-        _ => true,
-    };
-    hi_gt_a && lo_lt_b
-}
-
-/// SINGLE-PASS bucketing fold: walk the prefetched subtree ONCE and route
-/// each entry to its input prefix's bucket by an O(1) hash lookup on its `plen`-byte prefix — the
-/// set-membership frontier sweep that makes batched expansion O(entries), not O(frontier × tree). Same
-/// traversal order as `fold_prefix` (children in index order, then the interior buffer) so the
-/// `merge_into` LWW tie-break is unchanged.
-fn fold_into_buckets(
-    nodes: &NodeMap,
-    at: BlockId,
-    plen: usize,
-    index: &foldhash::HashMap<&[u8], usize>,
-    out: &mut [std::collections::BTreeMap<Vec<u8>, Entry>],
-) {
-    let route = |e: &Entry, out: &mut [std::collections::BTreeMap<Vec<u8>, Entry>]| {
-        if e.key.len() >= plen
-            && let Some(&i) = index.get(&e.key[..plen])
-        {
-            merge_into(&mut out[i], e);
-        }
-    };
-    match nodes[&at].as_ref() {
-        Node::Leaf { entries } => {
-            for e in entries {
-                route(e, out);
-            }
-        }
-        Node::Internal {
-            children, buffer, ..
-        } => {
-            for child in children {
-                if nodes.contains_key(child) {
-                    fold_into_buckets(nodes, *child, plen, index, out);
-                }
-            }
-            for e in buffer {
-                route(e, out);
-            }
-        }
-    }
-}
-
-impl<S: NodeStore> MemTree<S> {
-    /// Like `collect`, but only entries with key in `[lo, hi)`. Prunes an interior child whose key
-    /// range `[clo, chi)` is disjoint from the query window, so a narrow window touches O(window +
-    /// path). Buffer/leaf entries are membership-filtered.
-    async fn collect_range(
-        &self,
-        root: BlockId,
-        lo: Option<&[u8]>,
-        hi: Option<&[u8]>,
-        acc: &mut std::collections::BTreeMap<Vec<u8>, Entry>,
-    ) -> Result<(), TreeError> {
-        // I/O first (one wave per level), then a synchronous fold in the original
-        // recursion order — see `collect_prefix`.
-        let nodes = self
-            .fetch_pruned(root, |pivots, i| {
-                let clo = i.checked_sub(1).map(|j| pivots[j].as_slice());
-                let chi = pivots.get(i).map(|p| p.as_slice());
-                child_range_overlaps(clo, chi, lo, hi)
-            })
-            .await?;
-        fold_range(&nodes, root, lo, hi, acc);
-        Ok(())
-    }
-}
-
-/// Synchronous post-prefetch fold for `collect_range` — children in index order, then the buffer.
-fn fold_range(
-    nodes: &NodeMap,
-    at: BlockId,
-    lo: Option<&[u8]>,
-    hi: Option<&[u8]>,
-    acc: &mut std::collections::BTreeMap<Vec<u8>, Entry>,
-) {
-    let in_window =
-        |k: &[u8]| lo.map(|l| k >= l).unwrap_or(true) && hi.map(|h| k < h).unwrap_or(true);
-    match nodes[&at].as_ref() {
-        Node::Leaf { entries } => {
-            for e in entries {
-                if in_window(&e.key) {
-                    merge_into(acc, e);
-                }
-            }
-        }
-        Node::Internal {
-            pivots,
-            children,
-            buffer,
-        } => {
-            for (i, child) in children.iter().enumerate() {
-                // Child i covers [clo, chi): clo = pivots[i-1] (or unbounded), chi = pivots[i].
-                let clo = i.checked_sub(1).map(|j| pivots[j].as_slice());
-                let chi = pivots.get(i).map(|p| p.as_slice());
-                if child_range_overlaps(clo, chi, lo, hi) {
-                    fold_range(nodes, *child, lo, hi, acc);
-                }
-            }
-            for e in buffer {
-                if in_window(&e.key) {
-                    merge_into(acc, e);
-                }
-            }
-        }
-    }
-}
-
-/// Do two half-open ranges `[clo, chi)` and `[qlo, qhi)` (open bounds = None) overlap? Disjoint iff
-/// the child ends at/before the query start (`chi <= qlo`) or starts at/after the query end
-/// (`clo >= qhi`).
-fn child_range_overlaps(
-    clo: Option<&[u8]>,
-    chi: Option<&[u8]>,
-    qlo: Option<&[u8]>,
-    qhi: Option<&[u8]>,
-) -> bool {
-    if let (Some(chi), Some(qlo)) = (chi, qlo)
-        && chi <= qlo
-    {
-        return false;
-    }
-    if let (Some(clo), Some(qhi)) = (clo, qhi)
-        && clo >= qhi
-    {
-        return false;
-    }
-    true
-}
-
-/// Could a child covering `[lo, hi)` (open bounds = None) contain a key starting with `prefix`?
-/// Conservative — returns true unless the child range is provably disjoint from every prefix-match.
-fn child_range_may_contain_prefix(lo: Option<&[u8]>, hi: Option<&[u8]>, prefix: &[u8]) -> bool {
-    // No key starting with `prefix` can be < `prefix`, so if the child ends at or before `prefix`
-    // (and hi itself isn't a prefix-extension), the child is entirely below the matches.
-    if let Some(hi) = hi
-        && hi <= prefix
-        && !hi.starts_with(prefix)
-    {
-        return false;
-    }
-    // If the child starts strictly past the prefix range and doesn't share the prefix, it's above.
-    if let Some(lo) = lo
-        && lo > prefix
-        && !lo.starts_with(prefix)
-    {
-        return false;
-    }
-    true
-}
-
-/// LWW keep-or-replace over a BORROWED candidate: the clone (key + full value) happens only when the
-/// candidate actually wins — a losing candidate on the walk costs a comparison, not an allocation.
-fn pick_newer(best: &mut Option<Entry>, cand: &Entry) {
-    if best.as_ref().is_none_or(|b| cand.hlc > b.hlc) {
-        *best = Some(cand.clone());
-    }
-}
-
-/// Fold entry `e` into the accumulator. `collect`/`collect_*` apply CHILDREN first, then the interior
-/// BUFFER, so on an exact `(key, hlc)` tie the later-applied buffer entry must win — matching the
-/// point-read `pick_newer`, where the buffer (seen first on the root→leaf walk) also wins a tie. Hence
-/// `>=`, not `>`: the two read paths agree on a tie. (Same-`(key,hlc)` buffer-vs-leaf pairs cannot arise
-/// today — `merge_entries` collapses intra-commit duplicates at root injection before they descend —
-/// but keeping the tie-break consistent forecloses a latent point-read-vs-scan divergence.)
-fn merge_into(acc: &mut std::collections::BTreeMap<Vec<u8>, Entry>, e: &Entry) {
-    // Borrowed candidate: probe first, clone (key + value) ONLY on insert-or-win. The consuming shape
-    // cloned every scanned entry into the call, then the key again — 3 allocations per losing row.
-    match acc.get_mut(&e.key) {
-        Some(cur) => {
-            if e.hlc >= cur.hlc {
-                *cur = e.clone();
-            }
-        }
-        None => {
-            acc.insert(e.key.clone(), e.clone());
-        }
-    }
-}
-
-#[async_trait]
-impl<S: NodeStore> Tree for MemTree<S> {
-    async fn empty_root(&self) -> Result<BlockId, TreeError> {
-        // Standalone `put`: the empty leaf is a single shared node (deduped across every empty stream),
-        // not worth a pack — and it's created outside a tree-write walk.
-        self.store(&Node::Leaf {
-            entries: Vec::new(),
-        })
-        .await
-    }
-
-    async fn tree_put(&self, root: BlockId, msgs: Vec<BTreeMessage>) -> Result<BlockId, TreeError> {
-        let mut entries: Vec<Entry> = msgs
-            .into_iter()
-            .map(|m| Entry {
-                key: m.key,
-                hlc: m.hlc,
-                op: m.op,
-            })
-            .collect();
-        entries.sort_by(|a, b| a.key.cmp(&b.key).then(b.hlc.cmp(&a.hlc)));
-        // Walk the COW rewrite staging all new nodes, then land them as ONE packed batch before
-        // returning the new root: the batch is durable on return, so a caller can only publish the
-        // root after every node it reaches is durable.
         let mut staged = Staged::default();
-        let new_root = self.put_node(entries, root, &mut staged).await?;
-        self.flush(staged).await?;
-        Ok(new_root)
+        let entries = self.normalize(stamp, mutations, &mut staged)?;
+        self.apply_prepared(root, entries, staged).await
     }
 
-    async fn tree_get(&self, root: BlockId, key: &[u8]) -> Result<Option<Vec<u8>>, TreeError> {
-        Ok(self.get_entry(root, key).await?.and_then(|e| match e.op {
-            MessageOp::Upsert(v) => Some(v),
-            MessageOp::Tombstone => None,
-        }))
+    /// Read one key. Returns `None` when it is absent or tombstoned.
+    pub async fn get(&self, root: BlockId, key: &[u8]) -> Result<Option<Bytes>, TreeError> {
+        let mut budget = BudgetState::new(self.budget);
+        let mut scratch = self
+            .resolve_scratch
+            .lock()
+            .expect("resolve scratch pool lock")
+            .pop()
+            .unwrap_or_default();
+        if let Err(error) = self
+            .resolve_many_cached(root, &[key], &mut budget, &mut scratch)
+            .await
+        {
+            self.pool_resolve_scratch(scratch);
+            return Err(error);
+        }
+        let winner = scratch.best.pop().flatten();
+        self.pool_resolve_scratch(scratch);
+        match winner.map(|winner| winner.op) {
+            Some(WinnerOp::Inline(value)) => Ok(Some(value)),
+            Some(WinnerOp::External { id, len }) => Ok(Some(
+                self.load_values(&[(id, len)], &mut budget)
+                    .await?
+                    .pop()
+                    .expect("one external value reference"),
+            )),
+            Some(WinnerOp::Tombstone) | None => Ok(None),
+        }
     }
 
-    async fn tree_get_many(
+    /// Read many keys in O(tree depth) dependent node waves, preserving input order.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub async fn get_many(
         &self,
         root: BlockId,
         keys: &[&[u8]],
-    ) -> Result<Vec<Option<Vec<u8>>>, TreeError> {
-        Ok(self
-            .get_entry_many(root, keys)
-            .await?
-            .into_iter()
-            .map(|e| {
-                e.and_then(|e| match e.op {
-                    MessageOp::Upsert(v) => Some(v),
-                    MessageOp::Tombstone => None,
-                })
-            })
-            .collect())
-    }
-
-    async fn diff(&self, a: BlockId, b: BlockId) -> Result<Vec<Vec<u8>>, TreeError> {
-        if a == b {
-            return Ok(Vec::new()); // equal subtree ⇒ zero divergence, zero I/O
-        }
-        // **O(divergence), not O(corpus)**. Invariant: a key whose resolved value differs has
-        // its winning entry in a node UNSHARED by BlockId (if every node on both of k's resolution
-        // paths shared an id, resolution would be byte-identical). `candidate_keys` descends the two
-        // trees in ALIGNED LOCKSTEP: two internal nodes with the same pivots recurse child-position-
-        // wise, so an equal-BlockId child short-circuits (the COW-preserved off-path siblings of a
-        // localized edit); only a structural change (a split shifted pivots, or leaf-vs-internal) falls
-        // back to collecting that one subtree's keys. Visited work is O(divergence) for localized
-        // edits, O(subtree) at a structural change, O(corpus) only under a total reshape — never wrong
-        // (candidates are a superset; the per-key resolve below is exact and handles buffer overrides).
-        let mut candidates: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
-        self.candidate_keys(a, b, &mut candidates).await?;
-
-        let resolved = |e: Option<Entry>| -> Option<Vec<u8>> {
-            match e {
-                Some(Entry {
-                    op: MessageOp::Upsert(v),
-                    ..
-                }) => Some(v),
-                _ => None, // absent OR tombstone ⇒ observably None
+    ) -> Result<Vec<Option<Bytes>>, TreeError> {
+        let mut budget = BudgetState::new(self.budget);
+        let mut scratch = self
+            .resolve_scratch
+            .lock()
+            .expect("resolve scratch pool lock")
+            .pop()
+            .unwrap_or_default();
+        let mut materialize = self
+            .materialize_scratch
+            .lock()
+            .expect("materialize scratch pool lock")
+            .pop()
+            .unwrap_or_default();
+        if let Err(err) = self
+            .resolve_many_cached(root, keys, &mut budget, &mut scratch)
+            .await
+        {
+            self.pool_resolve_scratch(scratch);
+            self.pool_materialize_scratch(materialize);
+            return Err(err);
+        };
+        let values = match self
+            .materialize_cached(&scratch.best, &mut budget, &mut materialize)
+            .await
+        {
+            Ok(values) => values,
+            Err(err) => {
+                self.pool_materialize_scratch(materialize);
+                self.pool_resolve_scratch(scratch);
+                return Err(err);
             }
         };
-        let mut keys: Vec<Vec<u8>> = Vec::new();
-        for k in candidates {
-            let va = resolved(self.get_entry(a, &k).await?);
-            let vb = resolved(self.get_entry(b, &k).await?);
-            if va != vb {
-                keys.push(k);
-            }
-        }
-        Ok(keys) // already sorted + unique (BTreeSet iteration)
+        self.pool_resolve_scratch(scratch);
+        self.pool_materialize_scratch(materialize);
+        Ok(values)
     }
 
-    async fn scan_prefix(
+    /// Collect the sorted unique keys whose resolved values differ between two roots.
+    /// Use [`Self::diff_cursor`] for bounded-memory backpressure.
+    pub async fn diff(&self, a: BlockId, b: BlockId) -> Result<Vec<Bytes>, TreeError> {
+        let mut cursor = self.diff_cursor(a, b);
+        let mut differing = Vec::new();
+        while let Some(key) = cursor.next().await? {
+            differing.push(key);
+        }
+        Ok(differing)
+    }
+
+    /// Collect live entries in the half-open range `[lo, hi)`.
+    /// Use [`Self::scan_cursor`] for bounded-memory backpressure.
+    pub async fn scan_range(
+        &self,
+        root: BlockId,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+    ) -> Result<Vec<(Bytes, Bytes)>, TreeError> {
+        let mut cursor = self.scan_cursor(root, lo, hi);
+        let mut rows = Vec::new();
+        loop {
+            let batch = cursor.next_batch(256).await?;
+            if batch.is_empty() {
+                break;
+            }
+            rows.extend(batch);
+        }
+        Ok(rows)
+    }
+
+    /// Collect live entries whose keys begin with `prefix`.
+    pub async fn scan_prefix(
         &self,
         root: BlockId,
         prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
-        let mut acc = std::collections::BTreeMap::new();
-        self.collect_prefix(root, prefix, &mut acc).await?;
-        Ok(live_in_order(acc))
+    ) -> Result<Vec<(Bytes, Bytes)>, TreeError> {
+        let hi = prefix_succ(prefix);
+        self.scan_range(root, Some(prefix), hi.as_deref()).await
     }
 
-    async fn scan_prefix_many(
+    /// Scan many prefixes through one shared traversal, preserving prefix input order.
+    pub async fn scan_prefix_many(
         &self,
         root: BlockId,
         prefixes: &[&[u8]],
-    ) -> Result<Vec<Vec<(Vec<u8>, Vec<u8>)>>, TreeError> {
+    ) -> Result<Vec<Vec<(Bytes, Bytes)>>, TreeError> {
         if prefixes.is_empty() {
             return Ok(Vec::new());
         }
-        // ONE shared descent prefetching the frontier's SPAN — `[min prefix, succ(max prefix))` — with an
-        // O(1)-per-child overlap test (never O(frontier), the quadratic trap). One `load_wave` per level
-        // across the whole span; covering internal nodes deduped + cache-checked once.
-        let min_p = prefixes.iter().min().copied().unwrap();
-        let max_p = prefixes.iter().max().copied().unwrap();
-        let max_succ = prefix_succ(max_p);
-        let nodes = self
-            .fetch_pruned(root, |pivots, i| {
-                let lo = i.checked_sub(1).map(|j| pivots[j].as_slice());
-                let hi = pivots.get(i).map(|p| p.as_slice());
-                range_overlaps_span(lo, hi, min_p, max_succ.as_deref())
-            })
-            .await?;
-        let mut out: Vec<std::collections::BTreeMap<Vec<u8>, Entry>> =
-            vec![Default::default(); prefixes.len()];
-        // Fast path (the traversal case): all prefixes the SAME length ⇒ one bucketing pass keyed by the
-        // `plen`-byte prefix (O(entries), not O(frontier × tree)). Otherwise fall back to a per-prefix
-        // fold over the same prefetched nodes (correct, no extra I/O — only used for mixed-length inputs).
-        let plen = prefixes[0].len();
-        if prefixes.iter().all(|p| p.len() == plen) {
-            let mut index: foldhash::HashMap<&[u8], usize> =
-                foldhash::HashMap::with_capacity_and_hasher(prefixes.len(), Default::default());
-            for (i, p) in prefixes.iter().enumerate() {
-                index.entry(*p).or_insert(i);
-            }
-            fold_into_buckets(&nodes, root, plen, &index, &mut out);
-        } else {
-            for (i, p) in prefixes.iter().enumerate() {
-                fold_prefix(&nodes, root, p, &mut out[i]);
-            }
+        let ranges = prefixes
+            .iter()
+            .map(|prefix| KeyRange::new(Some(Bytes::copy_from_slice(prefix)), prefix_succ(prefix)))
+            .collect();
+        let mut budget = BudgetState::new(self.budget);
+        let mut cursor = self.cursor_over(root, ranges);
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.next_kv(&mut budget).await? {
+            rows.push(row);
         }
-        Ok(out.into_iter().map(live_in_order).collect())
+        let live = self.live_pairs(rows, &mut budget).await?;
+        Ok(bucket_by_prefix(prefixes, live))
     }
 
-    async fn scan_range(
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    async fn apply_prepared(
         &self,
         root: BlockId,
-        lo: Option<&[u8]>,
-        hi: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
-        let mut acc = std::collections::BTreeMap::new();
-        self.collect_range(root, lo, hi, &mut acc).await?;
-        Ok(live_in_order(acc))
-    }
-}
-
-/// MULTI-ROOT scans: every root's pruned subtree prefetches in ONE shared BFS (`fetch_pruned_multi`
-/// — one `get_many` wave per LEVEL across the whole root set), then folds per root into one
-/// accumulator. Callers are expected to supply roots with DISJOINT key spaces, so the shared BTreeMap
-/// is a merge, not an arbitration. Wave count stays O(max tree depth), not O(roots × depth).
-impl<S: NodeStore> MemTree<S> {
-    pub async fn scan_prefix_roots(
-        &self,
-        roots: &[BlockId],
-        prefix: &[u8],
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
-        let nodes = self
-            .fetch_pruned_multi(roots, |pivots, i| {
-                let lo = i.checked_sub(1).map(|j| pivots[j].as_slice());
-                let hi = pivots.get(i).map(|p| p.as_slice());
-                child_range_may_contain_prefix(lo, hi, prefix)
-            })
-            .await?;
-        let mut acc = std::collections::BTreeMap::new();
-        for root in dedup_roots(roots) {
-            fold_prefix(&nodes, root, prefix, &mut acc);
+        entries: Vec<Entry>,
+        mut staged: Staged,
+    ) -> Result<BlockId, TreeError> {
+        if entries.is_empty() {
+            return Ok(root);
         }
-        Ok(live_in_order(acc))
-    }
-
-    pub async fn scan_range_roots(
-        &self,
-        roots: &[BlockId],
-        lo: Option<&[u8]>,
-        hi: Option<&[u8]>,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
-        let nodes = self
-            .fetch_pruned_multi(roots, |pivots, i| {
-                let clo = i.checked_sub(1).map(|j| pivots[j].as_slice());
-                let chi = pivots.get(i).map(|p| p.as_slice());
-                child_range_overlaps(clo, chi, lo, hi)
-            })
+        let mut budget = BudgetState::new(self.budget);
+        let rw = self
+            .write_node(root, entries, &mut staged, &mut budget)
             .await?;
-        let mut acc = std::collections::BTreeMap::new();
-        for root in dedup_roots(roots) {
-            fold_range(&nodes, root, lo, hi, &mut acc);
+        let new_root = self.grow_root(rw, &mut staged)?;
+        if new_root == root {
+            return Ok(root);
         }
-        Ok(live_in_order(acc))
-    }
 
-    /// `scan_prefix_many` over many roots — a partitioned frontier expansion. Same span-pruned shared
-    /// descent and single-pass bucketing as the single-root form, seeded with every root.
-    pub async fn scan_prefix_many_roots(
-        &self,
-        roots: &[BlockId],
-        prefixes: &[&[u8]],
-    ) -> Result<Vec<Vec<(Vec<u8>, Vec<u8>)>>, TreeError> {
-        if prefixes.is_empty() || roots.is_empty() {
-            return Ok(vec![Vec::new(); prefixes.len()]);
-        }
-        let min_p = prefixes.iter().min().copied().unwrap();
-        let max_p = prefixes.iter().max().copied().unwrap();
-        let max_succ = prefix_succ(max_p);
-        let nodes = self
-            .fetch_pruned_multi(roots, |pivots, i| {
-                let lo = i.checked_sub(1).map(|j| pivots[j].as_slice());
-                let hi = pivots.get(i).map(|p| p.as_slice());
-                range_overlaps_span(lo, hi, min_p, max_succ.as_deref())
-            })
-            .await?;
-        let mut out: Vec<std::collections::BTreeMap<Vec<u8>, Entry>> =
-            vec![Default::default(); prefixes.len()];
-        let plen = prefixes[0].len();
-        let roots = dedup_roots(roots);
-        if prefixes.iter().all(|p| p.len() == plen) {
-            let mut index: foldhash::HashMap<&[u8], usize> =
-                foldhash::HashMap::with_capacity_and_hasher(prefixes.len(), Default::default());
-            for (i, p) in prefixes.iter().enumerate() {
-                index.entry(*p).or_insert(i);
+        let reachable = staged.reachable(&self.fmt, new_root)?;
+        let values_to_warm: Vec<(BlockId, Bytes)> = staged
+            .value_payloads
+            .iter()
+            .filter(|(id, _)| reachable.values.contains(id))
+            .cloned()
+            .collect();
+        staged.objects.retain(|object| {
+            if reachable.nodes.contains(&object.id) {
+                !self.cache.contains_key(&object.id)
+            } else if reachable.values.contains(&object.id) {
+                !self.values.contains_key(&object.id)
+            } else {
+                false
             }
-            for root in roots {
-                fold_into_buckets(&nodes, root, plen, &index, &mut out);
+        });
+        self.metrics.written(
+            staged.objects.len() as u64,
+            staged.bytes_hashed,
+            staged.duplicates_elided,
+        );
+        if !staged.objects.is_empty() {
+            self.store.put_batch(staged.objects, self.class).await?;
+        }
+        self.warm_cache(reachable.decoded_nodes).await;
+        self.warm_values(values_to_warm).await;
+        Ok(new_root)
+    }
+
+    // ---------------------------------------------------------------- loading
+
+    /// Load and validate one node. On a cache miss the raw bytes are hashed and compared with the
+    /// requested id *before* decoding, under [`VerifyPolicy::Always`].
+    #[doc(hidden)]
+    pub async fn view(&self, id: BlockId) -> Result<Arc<NodeView>, TreeError> {
+        let mut b = BudgetState::new(self.budget);
+        self.load(id, AccessHint::Random, &mut b).await
+    }
+
+    /// The hint a wave of nodes at `expect_level` deserves. Intent flows down: an internal level is
+    /// metadata a store should prefer to keep resident, while the leaf level of an ordered walk is
+    /// sequential. `None` is the root, whose kind is not yet known.
+    fn descent_hint(expect_level: Option<u16>, ordered: bool) -> AccessHint {
+        match expect_level {
+            Some(0) if ordered => AccessHint::SequentialPrefetch,
+            Some(0) => AccessHint::Random,
+            Some(_) => AccessHint::MetadataOnly,
+            None => AccessHint::Random,
+        }
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    async fn load(
+        &self,
+        id: BlockId,
+        hint: AccessHint,
+        budget: &mut BudgetState,
+    ) -> Result<Arc<NodeView>, TreeError> {
+        budget.visit(1)?;
+        if let Some(v) = self.cache.get(&id).await {
+            self.metrics.cache_hit();
+            return Ok(v);
+        }
+        self.metrics.cache_miss();
+        self.load_coalesced(id, hint, budget).await
+    }
+
+    /// Fetch one object, sharing the work with any concurrent caller that wants the same id.
+    ///
+    /// The byte budget is charged from the *observed* size afterwards rather than inside the loader, so a
+    /// caller that piggybacks on someone else's fetch is still charged for the bytes it consumed.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    async fn load_coalesced(
+        &self,
+        id: BlockId,
+        hint: AccessHint,
+        budget: &mut BudgetState,
+    ) -> Result<Arc<NodeView>, TreeError> {
+        if self.fmt.node_bytes() as u64 > budget.remaining_bytes() {
+            return Err(TreeError::ResourceLimit {
+                what: "bytes fetched",
+            });
+        }
+        let claim = self.node_flights.claim(&[id]);
+        if claim.owned_ids().next().is_some() {
+            let result = if let Some(view) = self.cache.get(&id).await {
+                Ok(view)
+            } else {
+                self.metrics.wave(1);
+                match self.store.get(id, hint, self.fmt.max_object_bytes()).await {
+                    Ok(bytes) => {
+                        self.metrics.object_fetched();
+                        self.metrics.bytes_read(bytes.len() as u64);
+                        match self.decode_verified(id, bytes) {
+                            Ok(view) => {
+                                let view = Arc::new(view);
+                                self.cache.insert(id, view.clone()).await;
+                                Ok(view)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            claim.complete(id, result);
+        }
+        let v = claim.wait(id).await?;
+        budget.spend_bytes(v.bytes().len() as u64)?;
+        Ok(v)
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    fn decode_verified(&self, id: BlockId, bytes: Bytes) -> Result<NodeView, TreeError> {
+        // Bound before decode: the store is asked for a limit, and the tree checks the answer too.
+        if bytes.len() > self.fmt.max_object_bytes() {
+            return Err(TreeError::decode(
+                Some(id),
+                DecodeError::OversizeObject {
+                    found: bytes.len(),
+                    limit: self.fmt.max_object_bytes(),
+                },
+            ));
+        }
+        if self.verify == VerifyPolicy::Always {
+            let actual = BlockId::of(&bytes);
+            self.metrics.bytes_verified(bytes.len() as u64);
+            if actual != id {
+                return Err(TreeError::HashMismatch {
+                    requested: id,
+                    actual,
+                });
             }
+        }
+        NodeView::decode(&self.fmt, Some(id), bytes)
+    }
+
+    /// Load a whole frontier in ONE `get_many` wave. Cache hits skip the fetch entirely; ids are
+    /// deduplicated because content addressing lets one subtree appear under several parents.
+    async fn load_wave(
+        &self,
+        ids: &[BlockId],
+        hint: AccessHint,
+        budget: &mut BudgetState,
+    ) -> Result<Wave, TreeError> {
+        self.wave(ids, hint, budget, true).await
+    }
+
+    /// Return a scratch to its pool with payload-bearing fields cleared. `Vec::clear` keeps the
+    /// allocated capacity — the point of pooling — while dropping the `Arc<NodeView>` entries
+    /// promptly, so an idle tree does not pin a whole wave of decoded nodes outside cache accounting.
+    fn pool_wave_scratch(&self, mut scratch: WaveScratch) {
+        scratch.entries.clear();
+        self.wave_scratch
+            .lock()
+            .expect("wave scratch pool lock")
+            .push(scratch);
+    }
+
+    /// As [`Self::pool_wave_scratch`]: drop winner payload `Bytes` before pooling.
+    fn pool_resolve_scratch(&self, mut scratch: ResolveScratch) {
+        scratch.best.clear();
+        self.resolve_scratch
+            .lock()
+            .expect("resolve scratch pool lock")
+            .push(scratch);
+    }
+
+    /// As [`Self::pool_wave_scratch`]: drop value payload `Bytes` before pooling.
+    fn pool_materialize_scratch(&self, mut scratch: MaterializeScratch) {
+        scratch.out.clear();
+        scratch.cached.clear();
+        self.materialize_scratch
+            .lock()
+            .expect("materialize scratch pool lock")
+            .push(scratch);
+    }
+
+    async fn wave_sorted_ids(
+        &self,
+        ids: &[BlockId],
+        hint: AccessHint,
+        budget: &mut BudgetState,
+        charge_visits: bool,
+    ) -> Result<(Wave, WaveScratch), TreeError> {
+        let mut scratch = self
+            .wave_scratch
+            .lock()
+            .expect("wave scratch pool lock")
+            .pop()
+            .unwrap_or_default();
+        let wave = self
+            .wave_cached(ids, true, hint, budget, charge_visits, &mut scratch)
+            .await;
+        match wave {
+            Ok(wave) => Ok((wave, scratch)),
+            Err(error) => {
+                self.pool_wave_scratch(scratch);
+                Err(error)
+            }
+        }
+    }
+
+    /// Breadth-first prefetch from `roots`, one batched read per level, stopping after `width` objects.
+    ///
+    /// This is what makes an ordered cursor's I/O batched rather than serial. A cursor is depth-first by
+    /// nature — that is what bounds its memory — so batching only one parent's children still costs about
+    /// one round trip per internal node. Expanding breadth-first under an explicit object budget gets the
+    /// round trips down to roughly `nodes / width` while keeping the memory bound explicit rather than
+    /// "the whole subtree".
+    async fn prefetch_ahead(
+        &self,
+        roots: Vec<BlockId>,
+        ranges: &RangeSet,
+        width: usize,
+        budget: &mut BudgetState,
+    ) {
+        let mut frontier = roots;
+        let mut fetched = 0usize;
+        while !frontier.is_empty() && fetched < width {
+            frontier.truncate(width - fetched);
+            fetched += frontier.len();
+            let Ok(wave) = self
+                .wave(&frontier, AccessHint::SequentialPrefetch, budget, false)
+                .await
+            else {
+                return;
+            };
+            // Expand only internal nodes, and only into children still in scope.
+            let mut next = Vec::new();
+            for id in &frontier {
+                let Some(v) = wave.get(id) else { continue };
+                if v.is_leaf() {
+                    continue;
+                }
+                for i in 0..v.child_count() {
+                    let (clo, chi) = v.child_range(i);
+                    let child = KeyRange::new(
+                        clo.map(Bytes::copy_from_slice),
+                        chi.map(Bytes::copy_from_slice),
+                    );
+                    if overlaps_scope(ranges, &child) {
+                        next.push(v.child(i));
+                    }
+                }
+            }
+            frontier = next;
+        }
+    }
+
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    async fn wave(
+        &self,
+        ids: &[BlockId],
+        hint: AccessHint,
+        budget: &mut BudgetState,
+        charge_visits: bool,
+    ) -> Result<Wave, TreeError> {
+        let mut scratch = self
+            .wave_scratch
+            .lock()
+            .expect("wave scratch pool lock")
+            .pop()
+            .unwrap_or_default();
+        let wave = self
+            .wave_cached(ids, false, hint, budget, charge_visits, &mut scratch)
+            .await;
+        self.pool_wave_scratch(scratch);
+        wave
+    }
+
+    async fn wave_cached(
+        &self,
+        ids: &[BlockId],
+        ids_are_sorted: bool,
+        hint: AccessHint,
+        budget: &mut BudgetState,
+        charge_visits: bool,
+        scratch: &mut WaveScratch,
+    ) -> Result<Wave, TreeError> {
+        scratch.reset();
+        let out = &mut scratch.entries;
+        if ids.is_empty() {
+            return Ok(Wave {
+                entries: std::mem::take(out),
+            });
+        }
+        if !ids_are_sorted && ids.len() > 1 {
+            scratch.ids.extend_from_slice(ids);
+            scratch.ids.sort_unstable();
+            scratch.ids.dedup();
         } else {
-            for root in roots {
-                for (i, p) in prefixes.iter().enumerate() {
-                    fold_prefix(&nodes, root, p, &mut out[i]);
+            // A caller declaring `ids_are_sorted` must also have deduplicated: this branch hands the
+            // ids to `node_flights.claim` as-is, and a duplicate would double-charge visits and claim
+            // one flight twice.
+            debug_assert!(
+                ids.windows(2).all(|w| w[0] < w[1]),
+                "sorted wave ids must be strictly ascending"
+            );
+            scratch.ids.extend_from_slice(ids);
+        }
+        for id in &scratch.ids {
+            // Object-visit budget is charged for hits too, so sharing cannot buy unbounded CPU work.
+            if charge_visits {
+                budget.visit(1)?;
+            }
+            match self.cache.get(id).await {
+                Some(v) => {
+                    if charge_visits {
+                        self.metrics.cache_hit();
+                    }
+                    out.push((*id, v));
+                }
+                None => {
+                    if charge_visits {
+                        self.metrics.cache_miss();
+                    }
+                    scratch.misses.push(*id);
                 }
             }
         }
-        Ok(out.into_iter().map(live_in_order).collect())
+        if scratch.misses.is_empty() {
+            return Ok(Wave {
+                entries: std::mem::take(out),
+            });
+        }
+        if scratch.misses.len() == 1 {
+            let id = scratch.misses[0];
+            let v = self.load_coalesced(id, hint, budget).await?;
+            out.push((id, v));
+            out.sort_unstable_by_key(|(id, _)| *id);
+            return Ok(Wave {
+                entries: std::mem::take(out),
+            });
+        }
+        // Early rejection, as for values: every node is exactly `node_bytes`, so the wave's cost is known
+        // before the read.
+        let declared = (self.fmt.node_bytes() as u64)
+            .checked_mul(scratch.misses.len() as u64)
+            .ok_or(TreeError::ResourceLimit {
+                what: "bytes fetched",
+            })?;
+        if declared > budget.remaining_bytes() {
+            return Err(TreeError::ResourceLimit {
+                what: "bytes fetched",
+            });
+        }
+        let allowance = budget.remaining_bytes();
+        let claim = self.node_flights.claim(&scratch.misses);
+        // A flight can finish and leave the map between the initial cache miss and `claim`. Recheck
+        // every newly owned id so that narrow race cannot turn a completed fill into a duplicate fetch.
+        let fetch = &mut scratch.fetch;
+        for id in claim.owned_ids() {
+            if let Some(view) = self.cache.get(&id).await {
+                claim.complete(id, Ok(view));
+            } else {
+                fetch.push(id);
+            }
+        }
+        if !fetch.is_empty() {
+            self.metrics.wave(1);
+            let fetched = self
+                .store
+                .get_many(fetch, hint, self.fmt.max_object_bytes(), allowance)
+                .await;
+            if fetched.len() != fetch.len() {
+                let error = TreeError::decode(
+                    None,
+                    DecodeError::BatchCardinality {
+                        found: fetched.len(),
+                        expected: fetch.len(),
+                    },
+                );
+                for id in fetch.iter() {
+                    claim.complete(*id, Err(error.clone()));
+                }
+            } else {
+                for (id, result) in fetch.iter().zip(fetched) {
+                    let result = match result {
+                        Ok(bytes) => {
+                            self.metrics.object_fetched();
+                            self.metrics.bytes_read(bytes.len() as u64);
+                            match self.decode_verified(*id, bytes) {
+                                Ok(view) => {
+                                    let view = Arc::new(view);
+                                    self.cache.insert(*id, view.clone()).await;
+                                    Ok(view)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
+                    claim.complete(*id, result);
+                }
+            }
+        }
+        for id in scratch.misses.drain(..) {
+            let v = claim.wait(id).await?;
+            budget.spend_bytes(v.bytes().len() as u64)?;
+            out.push((id, v));
+        }
+        // Cache hits and newly fetched misses are appended by different paths; restore the ordering
+        // required by `Wave::get` before exposing the wave.
+        out.sort_unstable_by_key(|(id, _)| *id);
+        Ok(Wave {
+            entries: std::mem::take(out),
+        })
+    }
+
+    /// One batched wave for out-of-line winners. Each envelope must agree with the
+    /// `external_value_len` its referencing node authenticated.
+    async fn load_values(
+        &self,
+        refs: &[(BlockId, u32)],
+        budget: &mut BudgetState,
+    ) -> Result<Vec<Bytes>, TreeError> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Deduplicate and consult the value cache first. Passing duplicate ids straight to `get_many`
+        // fetched one shared value once per reference — a value shared by N keys cost N fetches.
+        // Visits are charged here, once per REFERENCE (not per unique id): per `WorkBudget`, sharing
+        // must not turn into unbounded free CPU work. The deduplicated loader charges nothing.
+        let mut unique: Vec<(BlockId, u32)> = Vec::new();
+        let mut slot: Vec<usize> = Vec::with_capacity(refs.len());
+        let mut index: foldhash::HashMap<BlockId, usize> = Default::default();
+        for (id, len) in refs {
+            budget.visit(1)?;
+            match index.get(id) {
+                Some(&i) => slot.push(i),
+                None => {
+                    let i = unique.len();
+                    index.insert(*id, i);
+                    slot.push(i);
+                    unique.push((*id, *len));
+                }
+            }
+        }
+        let resolved = self.load_values_deduplicated(&unique, budget).await?;
+        // The cache is keyed by content id, but the logical length is authenticated independently by
+        // every referencing node. Validate *each* reference after deduplication, including cache hits;
+        // otherwise a correct first length can accidentally bless an inconsistent second reference.
+        refs.iter()
+            .zip(slot)
+            .map(|((id, len), i)| {
+                value::validate_reference_len(*id, &resolved[i], *len)?;
+                Ok(resolved[i].clone())
+            })
+            .collect()
+    }
+
+    async fn load_values_deduplicated(
+        &self,
+        refs: &[(BlockId, u32)],
+        budget: &mut BudgetState,
+    ) -> Result<Vec<Bytes>, TreeError> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Visits were already charged per reference by the caller; charging again here would bill
+        // each unique id twice.
+        let mut cached: Vec<Option<Bytes>> = Vec::with_capacity(refs.len());
+        let mut missing: Vec<(BlockId, u32)> = Vec::new();
+        for (id, len) in refs {
+            match self.values.get(id).await {
+                Some(payload) => {
+                    self.metrics.cache_hit();
+                    cached.push(Some(payload));
+                }
+                None => {
+                    missing.push((*id, *len));
+                    cached.push(None);
+                }
+            }
+        }
+        let fetched_unique = self.fetch_values_coalesced(&missing, budget).await?;
+        let mut fetched = fetched_unique.into_iter();
+        Ok(cached
+            .into_iter()
+            .map(|payload| match payload {
+                Some(payload) => payload,
+                None => fetched.next().expect("one fetch per miss"),
+            })
+            .collect())
+    }
+
+    async fn load_values_deduplicated_cached(
+        &self,
+        budget: &mut BudgetState,
+        scratch: &mut MaterializeScratch,
+    ) -> Result<(), TreeError> {
+        if scratch.refs.is_empty() {
+            return Ok(());
+        }
+        // Visits were already charged per reference in `materialize_cached`; `scratch.refs` holds the
+        // deduplicated ids, so charging here would price a batch by unique values instead of work.
+        scratch.cached.clear();
+        scratch.cached.reserve(scratch.refs.len());
+        scratch.missing.clear();
+        scratch.missing.reserve(scratch.refs.len());
+        for (id, len) in scratch.refs.iter() {
+            match self.values.get(id).await {
+                Some(payload) => {
+                    self.metrics.cache_hit();
+                    scratch.cached.push(Some(payload));
+                }
+                None => {
+                    scratch.missing.push((*id, *len));
+                    scratch.cached.push(None);
+                }
+            }
+        }
+        if scratch.missing.is_empty() {
+            return Ok(());
+        }
+        let mut missing = self
+            .fetch_values_coalesced(&scratch.missing, budget)
+            .await?
+            .into_iter();
+        for entry in scratch.cached.iter_mut() {
+            if entry.is_none() {
+                *entry =
+                    Some(missing.next().ok_or_else(|| {
+                        TreeError::store("fetched fewer values than cache misses")
+                    })?);
+            }
+        }
+        if missing.next().is_none() {
+            Ok(())
+        } else {
+            Err(TreeError::store("fetched more values than cache misses"))
+        }
+    }
+
+    async fn fetch_values_coalesced(
+        &self,
+        refs: &[(BlockId, u32)],
+        budget: &mut BudgetState,
+    ) -> Result<Vec<Bytes>, TreeError> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Early rejection: if the objects these references *declare* already exceed the operation's
+        // budget, fail before issuing the read.
+        let declared = refs
+            .iter()
+            .try_fold(0u64, |sum, (_, len)| {
+                sum.checked_add(u64::from(*len) + value::ENVELOPE_BYTES as u64)
+            })
+            .ok_or(TreeError::ResourceLimit {
+                what: "bytes fetched",
+            })?;
+        if declared > budget.remaining_bytes() {
+            return Err(TreeError::ResourceLimit {
+                what: "bytes fetched",
+            });
+        }
+        // The aggregate allowance handed to the store is the operation's REMAINING budget, per the
+        // contract — not `declared`. Capping the store at the declared total would turn a *substituted*
+        // value object (a larger valid object served for a smaller reference) into a resource-limit
+        // error, hiding the length mismatch that actually explains it. Substitution is caught by each
+        // reference's authenticated length instead, which is the diagnostic that tells an operator this
+        // is bit rot or a lying store rather than a budget that was set too low.
+        let allowance = budget.remaining_bytes();
+
+        let ids: Vec<BlockId> = refs.iter().map(|(id, _)| *id).collect();
+        let claim = self.value_flights.claim(&ids);
+        let mut fetch = Vec::new();
+        for id in claim.owned_ids().collect::<Vec<_>>() {
+            if let Some(payload) = self.values.get(&id).await {
+                claim.complete(id, Ok(payload));
+            } else {
+                fetch.push(id);
+            }
+        }
+        if !fetch.is_empty() {
+            self.metrics.wave(1);
+            let fetched = self
+                .store
+                .get_many(
+                    &fetch,
+                    AccessHint::Random,
+                    self.fmt.max_object_bytes(),
+                    allowance,
+                )
+                .await;
+            if fetched.len() != fetch.len() {
+                let error = TreeError::decode(
+                    None,
+                    DecodeError::BatchCardinality {
+                        found: fetched.len(),
+                        expected: fetch.len(),
+                    },
+                );
+                for id in &fetch {
+                    claim.complete(*id, Err(error.clone()));
+                }
+            } else {
+                for (id, result) in fetch.iter().zip(fetched) {
+                    let result = match result {
+                        Ok(bytes) => {
+                            self.metrics.object_fetched();
+                            self.metrics.bytes_read(bytes.len() as u64);
+                            let decoded = if bytes.len() > self.fmt.max_object_bytes() {
+                                Err(TreeError::decode(
+                                    Some(*id),
+                                    DecodeError::OversizeObject {
+                                        found: bytes.len(),
+                                        limit: self.fmt.max_object_bytes(),
+                                    },
+                                ))
+                            } else if self.verify == VerifyPolicy::Always {
+                                let actual = BlockId::of(&bytes);
+                                self.metrics.bytes_verified(bytes.len() as u64);
+                                if actual != *id {
+                                    Err(TreeError::HashMismatch {
+                                        requested: *id,
+                                        actual,
+                                    })
+                                } else {
+                                    value::decode_payload(*id, &bytes, self.fmt.schema_id())
+                                }
+                            } else {
+                                value::decode_payload(*id, &bytes, self.fmt.schema_id())
+                            };
+                            match decoded {
+                                Ok(payload) => {
+                                    self.values.insert(*id, payload.clone()).await;
+                                    Ok(payload)
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Err(error) => Err(error),
+                    };
+                    claim.complete(*id, result);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(refs.len());
+        for (id, _) in refs {
+            let payload = claim.wait(*id).await?;
+            budget.spend_bytes((payload.len() + value::ENVELOPE_BYTES) as u64)?;
+            out.push(payload);
+        }
+        Ok(out)
+    }
+
+    // ---------------------------------------------------------------- writing
+
+    /// Normalize one caller batch: collapse repeated keys to the **last** mutation in program order,
+    /// attach the batch stamp, externalize large values, then sort. Every limit is checked here, before
+    /// any object is stored.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    fn normalize(
+        &self,
+        stamp: VersionStamp,
+        mutations: Vec<Mutation>,
+        staged: &mut Staged,
+    ) -> Result<Vec<Entry>, TreeError> {
+        let mut order: Vec<Bytes> = Vec::with_capacity(mutations.len());
+        let mut last: foldhash::HashMap<Bytes, MutationOp> =
+            foldhash::HashMap::with_capacity_and_hasher(mutations.len(), Default::default());
+        for m in mutations {
+            self.fmt.check_key(&m.key)?;
+            if let MutationOp::Upsert(v) = &m.op {
+                self.fmt.check_value(v)?;
+            }
+            if last.insert(m.key.clone(), m.op).is_none() {
+                order.push(m.key);
+            }
+        }
+        let mut entries = Vec::with_capacity(order.len());
+        // `Bytes::clone` preserves the same immutable slice. Memoize by that live slice identity before
+        // allocating an envelope or hashing it: one 4 MiB `Bytes` shared by 256 keys must be read and
+        // hashed once, not 256 times. Separately allocated equal payloads still require hashing to prove
+        // equality; the addressed staging set deduplicates their eventual store submission.
+        let mut encoded_values: foldhash::HashMap<(usize, usize), value::ValueObject> =
+            Default::default();
+        for key in order {
+            let op = last.remove(&key).expect("inserted above");
+            entries.push(match op {
+                MutationOp::Tombstone => Entry::tombstone(key, stamp.order_key),
+                MutationOp::Upsert(v) if self.fmt.is_inline(v.len()) => {
+                    self.metrics.inline_value(v.len() as u64);
+                    Entry::inline(key, stamp.order_key, v)
+                }
+                MutationOp::Upsert(v) => {
+                    let identity = (v.as_ptr() as usize, v.len());
+                    let obj = match encoded_values.get(&identity) {
+                        Some(obj) => obj.clone(),
+                        None => {
+                            let obj = value::encode(self.fmt.schema_id(), &v);
+                            self.metrics.value_object_encoded(obj.bytes.len() as u64);
+                            encoded_values.insert(identity, obj.clone());
+                            obj
+                        }
+                    };
+                    if obj.bytes.len() > self.fmt.max_object_bytes() {
+                        return Err(TreeError::Capacity(CapacityError::ObjectTooLarge {
+                            len: obj.bytes.len(),
+                            limit: self.fmt.max_object_bytes(),
+                        }));
+                    }
+                    self.metrics.external_value(v.len() as u64);
+                    // The value object is in the same durable batch as the nodes referencing it.
+                    // `value::encode` already hashed these bytes to address them, so reuse that id
+                    // rather than hashing the whole payload a second time.
+                    staged.value(&obj);
+                    Entry::external(key, stamp.order_key, obj.id, obj.logical_len)
+                }
+            });
+        }
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(entries)
+    }
+
+    /// Merge two sorted runs, retaining the entry with the greater winner tuple. Equal stamps compare
+    /// their exact `operation_tiebreak`; byte-identical operations are idempotent. No persisted tie
+    /// depends on queue position, tree level, traversal order, or which replica merged.
+    fn merge_runs(mut a: Vec<Entry>, b: Vec<Entry>) -> Vec<Entry> {
+        if a.is_empty() {
+            return b;
+        }
+        if b.is_empty() {
+            return a;
+        }
+        let mut out = Vec::with_capacity(a.len() + b.len());
+        let mut ia = a.drain(..).peekable();
+        let mut ib = b.into_iter().peekable();
+        loop {
+            match (ia.peek(), ib.peek()) {
+                (Some(x), Some(y)) => match x.key.cmp(&y.key) {
+                    std::cmp::Ordering::Less => out.push(ia.next().expect("peeked")),
+                    std::cmp::Ordering::Greater => out.push(ib.next().expect("peeked")),
+                    std::cmp::Ordering::Equal => {
+                        let (x, y) = (ia.next().expect("peeked"), ib.next().expect("peeked"));
+                        out.push(if y.winner() > x.winner() { y } else { x });
+                    }
+                },
+                (Some(_), None) => out.push(ia.next().expect("peeked")),
+                (None, Some(_)) => out.push(ib.next().expect("peeked")),
+                (None, None) => break,
+            }
+        }
+        out
+    }
+
+    fn blob_of(&self, entries: &[Entry]) -> usize {
+        entries.iter().map(Entry::blob_len).sum()
+    }
+
+    fn accounted_of(&self, entries: &[Entry]) -> usize {
+        entries
+            .len()
+            .saturating_mul(self.fmt.desc_bytes())
+            .saturating_add(self.blob_of(entries))
+    }
+
+    /// Which child owns `key`, given the *current* pivots. Recomputed after every splice, because a
+    /// split shifts indices.
+    fn child_of(&self, pivots: &[Bytes], key: &[u8]) -> usize {
+        pivots.partition_point(|p| p.as_ref() <= key)
+    }
+
+    /// The shortest prefix of `right` that remains strictly above `left`. A separator need not repeat
+    /// the complete minimum key of its right child; this is what keeps unrelated 4 KiB keys from
+    /// consuming 4 KiB in every pivot lane.
+    fn shortest_separator(left: &[u8], right: &[u8]) -> Bytes {
+        debug_assert!(left < right);
+        let shared = left.iter().zip(right).take_while(|(a, b)| a == b).count();
+        Bytes::copy_from_slice(&right[..(shared + 1).min(right.len())])
+    }
+
+    /// Split a sorted run into leaves: take the longest non-empty prefix that fits both the slot and
+    /// the blob limit, then repeat. Deterministic; a final sparse leaf is permitted.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    fn pack_leaves(&self, entries: Vec<Entry>) -> Vec<(Option<Bytes>, Vec<Entry>)> {
+        if entries.is_empty() {
+            return vec![(None, Vec::new())];
+        }
+        let mut out: Vec<(Option<Bytes>, Vec<Entry>)> = Vec::new();
+        let mut cur: Vec<Entry> = Vec::new();
+        let mut cur_lo: Option<Bytes> = None;
+        let mut raw_blob = 0usize;
+        for e in entries {
+            let next_raw = raw_blob + e.blob_len();
+            let next_count = cur.len() + 1;
+            let skip = if self.fmt.compresses_pivots() && next_count > 1 {
+                crate::search::head_skip(
+                    cur.first().map(|entry| entry.key.as_ref()),
+                    Some(&e.key),
+                    next_count,
+                ) as usize
+            } else {
+                0
+            };
+            let compressed_blob = next_raw - next_count * skip + skip;
+            if !cur.is_empty()
+                && !self
+                    .fmt
+                    .leaf_entries_fit(next_count, next_raw, compressed_blob)
+            {
+                let separator =
+                    Self::shortest_separator(&cur.last().expect("nonempty").key, &e.key);
+                out.push((cur_lo.take(), std::mem::take(&mut cur)));
+                cur_lo = Some(separator);
+                raw_blob = 0;
+            }
+            raw_blob += e.blob_len();
+            cur.push(e);
+        }
+        if !cur.is_empty() {
+            out.push((cur_lo, cur));
+        }
+        out
+    }
+
+    /// Contiguous groups bounded by both child lanes and compressed pivot bytes. The selected format
+    /// therefore retains fanout 32 for ordinary/shared-prefix keys while pathological unrelated long
+    /// separators reduce only the affected node's realized fanout.
+    fn group_sizes_for_pivots(&self, pivots: &[Bytes]) -> Vec<usize> {
+        let n = pivots.len() + 1;
+        if n <= self.fmt.f_max() && self.fmt.pivots_fit(pivots) {
+            return vec![n];
+        }
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at < n {
+            let remaining = n - at;
+            if remaining <= 3 {
+                // Format construction proves two maximum-size pivots fit, so a final 2- or 3-child
+                // node is always representable.
+                out.push(remaining);
+                break;
+            }
+            let mut size = 2usize;
+            while size < remaining && size < self.fmt.f_max() {
+                let candidate = size + 1;
+                if !self.fmt.pivots_fit(&pivots[at..at + candidate - 1]) {
+                    break;
+                }
+                size = candidate;
+            }
+            if remaining - size == 1 {
+                size -= 1;
+            }
+            out.push(size);
+            at += size;
+        }
+        debug_assert_eq!(out.iter().sum::<usize>(), n);
+        debug_assert!(out.iter().all(|&size| size >= 2));
+        out
+    }
+
+    fn write_node<'a>(
+        &'a self,
+        id: BlockId,
+        msgs: Vec<Entry>,
+        staged: &'a mut Staged,
+        budget: &'a mut BudgetState,
+    ) -> Fut<'a, Rewrite> {
+        Box::pin(async move {
+            // A COW rewrite is a random walk down one path, not an ordered sweep.
+            let view = self.load(id, AccessHint::Random, budget).await?;
+            if view.is_leaf() {
+                let existing: Vec<Entry> = view.entries().collect();
+                let merged = Self::merge_runs(existing, msgs);
+                self.emit_leaves(merged, staged)
+            } else {
+                self.write_internal(&view, msgs, staged, budget).await
+            }
+        })
+    }
+
+    fn emit_leaves(&self, entries: Vec<Entry>, staged: &mut Staged) -> Result<Rewrite, TreeError> {
+        let packed = self.pack_leaves(entries);
+        self.metrics.leaves_written(packed.len() as u64);
+        let mut layer = Vec::with_capacity(packed.len());
+        for (_, es) in &packed {
+            layer.push(codec::encode_leaf(&self.fmt, es)?);
+        }
+        let ids = staged.layer(layer);
+        Ok(Rewrite {
+            first: ids[0],
+            following: packed
+                .into_iter()
+                .zip(&ids)
+                .skip(1)
+                .map(|((min, _), id)| (min.expect("only the first run has no min key"), *id))
+                .collect(),
+            level: 0,
+        })
+    }
+
+    fn write_internal<'a>(
+        &'a self,
+        view: &'a NodeView,
+        msgs: Vec<Entry>,
+        staged: &'a mut Staged,
+        budget: &'a mut BudgetState,
+    ) -> Fut<'a, Rewrite> {
+        Box::pin(async move {
+            let children: Vec<BlockId> = view.children().collect();
+            let pivots: Vec<Bytes> = (0..view.pivot_count())
+                .map(|i| view.pivot_bytes(i))
+                .collect();
+            let existing: Vec<Entry> = view.entries().collect();
+
+            // A mutation whose accounted message cannot fit an EMPTY regular buffer is routed directly
+            // toward its leaf: buffering is sacrificed for it rather than creating a second node shape.
+            let (direct, ordinary): (Vec<Entry>, Vec<Entry>) = msgs
+                .into_iter()
+                .partition(|e| self.fmt.message_is_oversized(e.key.len(), e.span.len()));
+            self.metrics.direct_routed(direct.len() as u64);
+
+            let node = InternalBuilder {
+                level: view.tree_level(),
+                children,
+                pivots,
+                buffer: Self::merge_runs(existing, ordinary),
+                direct,
+            };
+            self.finish_internal(node, staged, budget).await
+        })
+    }
+
+    /// Flush until the transient builder is within regular capacity, then serialize — or partition if
+    /// integration pushed it past `F_MAX`. The builder may hold more than `F_MAX` children transiently;
+    /// an overfull node is never serialized.
+    fn finish_internal<'a>(
+        &'a self,
+        mut node: InternalBuilder,
+        staged: &'a mut Staged,
+        budget: &'a mut BudgetState,
+    ) -> Fut<'a, Rewrite> {
+        Box::pin(async move {
+            loop {
+                // 1. Directly routed oversized messages first. They do NOT participate in the flush
+                //    lower bound, so they are handled separately from buffer accounting.
+                if !node.direct.is_empty() {
+                    let victim = self.child_of(&node.pivots, &node.direct[0].key);
+                    let mut group = Vec::new();
+                    let mut rest = Vec::with_capacity(node.direct.len());
+                    for e in node.direct {
+                        if self.child_of(&node.pivots, &e.key) == victim {
+                            group.push(e);
+                        } else {
+                            rest.push(e);
+                        }
+                    }
+                    node.direct = rest;
+                    let rw = self
+                        .write_node(node.children[victim], group, staged, budget)
+                        .await?;
+                    self.check_child_level(node.level, rw.level)?;
+                    node.splice(victim, rw);
+                    if node.needs_partition(&self.fmt) {
+                        return self.partition(node, staged, budget).await;
+                    }
+                    continue;
+                }
+
+                // 2. Ordinary fullness: either the slot capacity or the encoded blob region.
+                if self
+                    .fmt
+                    .buffer_fits(node.buffer.len(), self.blob_of(&node.buffer))
+                {
+                    break;
+                }
+
+                let mut by_child: Vec<Vec<Entry>> = vec![Vec::new(); node.children.len()];
+                for e in node.buffer.drain(..) {
+                    let i = self.child_of(&node.pivots, &e.key);
+                    by_child[i].push(e);
+                }
+                let weights: Vec<usize> = by_child.iter().map(|g| self.accounted_of(g)).collect();
+                // Greatest pending encoded byte count; lowest child index is the deterministic
+                // tie-break.
+                let victim = (0..weights.len())
+                    .max_by_key(|&i| (weights[i], std::cmp::Reverse(i)))
+                    .expect("an internal node has children");
+                let total: usize = weights.iter().sum();
+                self.metrics.flush(
+                    total as u64,
+                    weights[victim] as u64,
+                    node.children.len() as u64,
+                );
+                let floor = (total.div_ceil(node.children.len())).max(self.fmt.min_flush_bytes());
+                if weights[victim] < floor {
+                    self.metrics.undersized_flush();
+                    debug_assert!(
+                        false,
+                        "flush victim {} bytes is below the guaranteed floor {floor}",
+                        weights[victim]
+                    );
+                }
+
+                let group = std::mem::take(&mut by_child[victim]);
+                node.buffer = by_child.into_iter().flatten().collect();
+                debug_assert!(node.buffer.windows(2).all(|w| w[0].key < w[1].key));
+
+                let rw = self
+                    .write_node(node.children[victim], group, staged, budget)
+                    .await?;
+                self.check_child_level(node.level, rw.level)?;
+                node.splice(victim, rw);
+                if node.needs_partition(&self.fmt) {
+                    return self.partition(node, staged, budget).await;
+                }
+            }
+
+            self.metrics
+                .internal_written(node.children.len() as u64, node.buffer.len() as u64);
+            let bytes = codec::encode_internal(
+                &self.fmt,
+                node.level,
+                &node.pivots,
+                &node.children,
+                &node.buffer,
+            )?;
+            Ok(Rewrite::single(staged.one(bytes), node.level))
+        })
+    }
+
+    /// A parent may only accept a replacement run whose nodes sit exactly one level below it.
+    fn check_child_level(&self, parent: u16, child: u16) -> Result<(), TreeError> {
+        if parent != child + 1 {
+            return Err(TreeError::decode(
+                None,
+                DecodeError::ChildLevel { child, parent },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Partition an overfull internal builder into contiguous groups, partitioning the buffer at every
+    /// promoted pivot. This is required by the Bε path invariant: every message for key `k` must remain
+    /// on `k`'s root-to-leaf path.
+    fn partition<'a>(
+        &'a self,
+        node: InternalBuilder,
+        staged: &'a mut Staged,
+        budget: &'a mut BudgetState,
+    ) -> Fut<'a, Rewrite> {
+        Box::pin(async move {
+            let sizes = self.group_sizes_for_pivots(&node.pivots);
+            self.metrics.internal_partition(sizes.len() as u64);
+            let mut runs: Vec<(Option<Bytes>, Rewrite)> = Vec::with_capacity(sizes.len());
+            let mut at = 0usize;
+            // Buffers are partitioned by the promoted pivots, so each output receives exactly the
+            // messages in its child-key range.
+            let mut buffer = VecDeque::from(node.buffer);
+            let mut direct = VecDeque::from(node.direct);
+            for (g, size) in sizes.iter().copied().enumerate() {
+                let end = at + size;
+                let group_lo: Option<Bytes> = at.checked_sub(1).map(|j| node.pivots[j].clone());
+                let group_hi: Option<Bytes> =
+                    (end - 1 < node.pivots.len()).then(|| node.pivots[end - 1].clone());
+                let take = |q: &mut VecDeque<Entry>, hi: &Option<Bytes>| -> Vec<Entry> {
+                    let mut out = Vec::new();
+                    while let Some(front) = q.front() {
+                        let inside = match hi {
+                            Some(h) => front.key < *h,
+                            None => true,
+                        };
+                        if !inside {
+                            break;
+                        }
+                        out.push(q.pop_front().expect("peeked"));
+                    }
+                    out
+                };
+                let local_buffer = take(&mut buffer, &group_hi);
+                let local_direct = take(&mut direct, &group_hi);
+                let local_children = node.children[at..end].to_vec();
+                let local_pivots = node.pivots[at..end - 1].to_vec();
+                let rw = self
+                    .finish_internal(
+                        InternalBuilder {
+                            level: node.level,
+                            children: local_children,
+                            pivots: local_pivots,
+                            buffer: local_buffer,
+                            direct: local_direct,
+                        },
+                        staged,
+                        budget,
+                    )
+                    .await?;
+                runs.push((if g == 0 { None } else { group_lo }, rw));
+                at = end;
+            }
+            debug_assert!(buffer.is_empty() && direct.is_empty());
+
+            // Concatenate the group runs into one ordered replacement run.
+            let mut it = runs.into_iter();
+            let (_, head) = it.next().expect("at least one group");
+            let mut following = head.following;
+            for (min, rw) in it {
+                following.push((
+                    min.expect("only the first group has no promoted pivot"),
+                    rw.first,
+                ));
+                following.extend(rw.following);
+            }
+            Ok(Rewrite {
+                first: head.first,
+                following,
+                level: node.level,
+            })
+        })
+    }
+
+    /// If a root rewrite produced more than one node, build new internal levels from the replacement run
+    /// until one root remains. A sufficiently large commit may therefore grow the tree by more than one
+    /// level without ever encoding an over-capacity node.
+    fn grow_root(&self, mut rw: Rewrite, staged: &mut Staged) -> Result<BlockId, TreeError> {
+        while !rw.following.is_empty() {
+            let level = u32::from(rw.level) + 1;
+            if level > u32::from(self.fmt.max_tree_level()) {
+                return Err(TreeError::Capacity(CapacityError::TreeTooTall {
+                    level,
+                    limit: self.fmt.max_tree_level(),
+                }));
+            }
+            let level = level as u16;
+            let ids = rw.ids();
+            let mins: Vec<Option<Bytes>> = std::iter::once(None)
+                .chain(rw.following.iter().map(|(k, _)| Some(k.clone())))
+                .collect();
+            let root_pivots: Vec<Bytes> = mins.iter().skip(1).flatten().cloned().collect();
+            let sizes = self.group_sizes_for_pivots(&root_pivots);
+            let mut layer = Vec::with_capacity(sizes.len());
+            let mut group_mins: Vec<Option<Bytes>> = Vec::with_capacity(sizes.len());
+            let mut at = 0usize;
+            for size in sizes {
+                let end = at + size;
+                let group_children = &ids[at..end];
+                let group_pivots: Vec<Bytes> = mins[at + 1..end]
+                    .iter()
+                    .map(|m| m.clone().expect("only index 0 lacks a min key"))
+                    .collect();
+                layer.push(codec::encode_internal(
+                    &self.fmt,
+                    level,
+                    &group_pivots,
+                    group_children,
+                    &[],
+                )?);
+                group_mins.push(mins[at].clone());
+                at = end;
+            }
+            self.metrics.root_grown();
+            let new_ids = staged.layer(layer);
+            rw = Rewrite {
+                first: new_ids[0],
+                following: new_ids
+                    .iter()
+                    .zip(group_mins)
+                    .skip(1)
+                    .map(|(id, min)| (min.expect("non-first groups have a min key"), *id))
+                    .collect(),
+                level,
+            };
+        }
+        Ok(rw.first)
+    }
+
+    /// Insert freshly written nodes into the decoded cache. They are already known-canonical, but they
+    /// are re-validated here rather than trusted: the cost is one decode, and it makes an encoder bug a
+    /// loud local failure instead of a corrupt cached view. A node that somehow fails is simply not
+    /// cached, never fatal — the store has the authoritative bytes.
+    async fn warm_cache(&self, nodes: Vec<(BlockId, Arc<NodeView>)>) {
+        for (id, view) in nodes {
+            if self.cache.contains_key(&id) {
+                continue;
+            }
+            self.metrics.cache_warmed();
+            self.cache.insert(id, view).await;
+        }
+    }
+
+    async fn warm_values(&self, values: Vec<(BlockId, Bytes)>) {
+        for (id, payload) in values {
+            if !self.values.contains_key(&id) {
+                self.values.insert(id, payload).await;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- reading
+
+    /// Resolve many keys to their winners in O(depth) dependent waves, grouping probes by node so each
+    /// validated head surface is reused for every probe assigned to it.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    async fn resolve_many_cached(
+        &self,
+        root: BlockId,
+        keys: &[&[u8]],
+        budget: &mut BudgetState,
+        scratch: &mut ResolveScratch,
+    ) -> Result<(), TreeError> {
+        scratch.reset(keys.len());
+        if keys.is_empty() {
+            return Ok(());
+        }
+        if keys.len() == 1 {
+            return self
+                .resolve_one_cached(root, keys[0], budget, scratch)
+                .await;
+        }
+        // (probe index, node id, the level its parent claimed)
+        scratch
+            .frontier
+            .extend((0..keys.len()).map(|i| (i, root, u16::MAX)));
+
+        let frontier = &mut scratch.frontier;
+        let mut frontier_is_sorted = true;
+
+        for _ in 0..=u32::from(self.fmt.max_tree_level()) {
+            let mut next_sorted = true;
+            if frontier.is_empty() {
+                break;
+            }
+            if !frontier_is_sorted {
+                frontier.sort_unstable_by_key(|(_, id, _)| *id);
+            }
+            // Every probe descends in lockstep, so one frontier is one level and one hint.
+            let hint =
+                Self::descent_hint((frontier[0].2 != u16::MAX).then_some(frontier[0].2), false);
+
+            scratch.ids.clear();
+            for &(_, id, _) in frontier.iter() {
+                if scratch.ids.last() != Some(&id) {
+                    scratch.ids.push(id);
+                }
+            }
+
+            let (wave, mut wave_scratch) = self
+                .wave_sorted_ids(&scratch.ids, hint, budget, true)
+                .await?;
+
+            scratch.next.clear();
+            scratch.next.reserve(frontier.len());
+            let mut i = 0usize;
+            while i < frontier.len() {
+                let id = frontier[i].1;
+                let expect = frontier[i].2;
+                // Traversal rejects an edge unless the child's level is exactly one below its parent.
+                let tree_level = wave.get(&id).expect("loaded in this wave").tree_level();
+                if expect != u16::MAX && tree_level != expect {
+                    let parent = expect + 1;
+                    wave_scratch.entries = wave.entries;
+                    self.pool_wave_scratch(wave_scratch);
+                    return Err(TreeError::decode(
+                        Some(id),
+                        DecodeError::ChildLevel {
+                            child: tree_level,
+                            parent,
+                        },
+                    ));
+                }
+
+                let v = wave.get(&id).expect("loaded in this wave");
+                let surface = v.entry_surface();
+                let is_leaf = v.is_leaf();
+                let pivot_surface = (!is_leaf).then(|| v.pivot_surface());
+                let child_level = if is_leaf {
+                    None
+                } else {
+                    let Some(level) = tree_level.checked_sub(1) else {
+                        self.pool_wave_scratch(wave_scratch);
+                        return Err(TreeError::decode(
+                            Some(id),
+                            DecodeError::ChildLevel {
+                                child: tree_level,
+                                parent: tree_level,
+                            },
+                        ));
+                    };
+                    Some(level)
+                };
+                let mut end = i + 1;
+                while end < frontier.len() && frontier[end].1 == id {
+                    end += 1;
+                }
+
+                for &(p, _, _) in &frontier[i..end] {
+                    let key = keys[p];
+                    let f = surface.probe(key);
+                    self.metrics.probe(f.cost);
+                    if f.exact {
+                        let w = v.winner(f.index);
+                        if scratch.best[p].as_ref().is_none_or(|b| w > *b) {
+                            scratch.best[p] = Some(w);
+                        }
+                    } else if !is_leaf {
+                        // Priced for a future routing summary: a probe that touched a buffer and found
+                        // nothing is exactly the work a summary could have skipped.
+                        self.metrics.absent_key_buffer_probe();
+                    }
+                    if let Some(ps) = &pivot_surface {
+                        let child = ps.probe(key).upper_bound();
+                        let child_id = v.child(child);
+                        let child_level = child_level.unwrap();
+                        if let Some(last_id) = scratch.next.last().map(|(_, child_id, _)| *child_id)
+                            && child_id < last_id
+                        {
+                            next_sorted = false;
+                        }
+                        scratch.next.push((p, child_id, child_level));
+                    }
+                }
+
+                i = end;
+            }
+            // `wave_cached` moves the entries vector into `Wave` so it can be searched while this
+            // level is processed. Recycle that vector's capacity along with the remaining wave
+            // scratch before the next dependent level.
+            wave_scratch.entries = wave.entries;
+            self.pool_wave_scratch(wave_scratch);
+            std::mem::swap(frontier, &mut scratch.next);
+            frontier_is_sorted = next_sorted;
+        }
+        if !frontier.is_empty() {
+            return Err(TreeError::ResourceLimit {
+                what: "tree depth above max_tree_level",
+            });
+        }
+        Ok(())
+    }
+
+    /// Scalar descent for a point read. The general grouped frontier is valuable once several keys
+    /// share a wave, but it adds frontier construction and wave-result plumbing to the one-key case.
+    /// This path keeps the same level, budget, hash, and structural validation contracts as grouped
+    /// traversal while using the single-object cache/load fast path at each depth.
+    async fn resolve_one_cached(
+        &self,
+        root: BlockId,
+        key: &[u8],
+        budget: &mut BudgetState,
+        scratch: &mut ResolveScratch,
+    ) -> Result<(), TreeError> {
+        scratch.best.clear();
+        scratch.best.resize(1, None);
+        let mut id = root;
+        let mut expect = u16::MAX;
+        for _ in 0..=u32::from(self.fmt.max_tree_level()) {
+            let hint = Self::descent_hint((expect != u16::MAX).then_some(expect), false);
+            let view = self.load(id, hint, budget).await?;
+            let tree_level = view.tree_level();
+            if expect != u16::MAX && tree_level != expect {
+                return Err(TreeError::decode(
+                    Some(id),
+                    DecodeError::ChildLevel {
+                        child: tree_level,
+                        parent: expect + 1,
+                    },
+                ));
+            }
+            let found = view.entry_surface().probe(key);
+            self.metrics.probe(found.cost);
+            if found.exact {
+                let winner = view.winner(found.index);
+                if scratch.best[0].as_ref().is_none_or(|best| winner > *best) {
+                    scratch.best[0] = Some(winner);
+                }
+            } else if !view.is_leaf() {
+                self.metrics.absent_key_buffer_probe();
+            }
+            if view.is_leaf() {
+                return Ok(());
+            }
+            let Some(child_level) = tree_level.checked_sub(1) else {
+                return Err(TreeError::decode(
+                    Some(id),
+                    DecodeError::ChildLevel {
+                        child: tree_level,
+                        parent: tree_level,
+                    },
+                ));
+            };
+            let child = view.child(view.pivot_surface().probe(key).upper_bound());
+            id = child;
+            expect = child_level;
+        }
+        Err(TreeError::ResourceLimit {
+            what: "tree depth above max_tree_level",
+        })
+    }
+
+    async fn resolve_many(
+        &self,
+        root: BlockId,
+        keys: &[&[u8]],
+        budget: &mut BudgetState,
+    ) -> Result<Vec<Option<Winner>>, TreeError> {
+        let mut scratch = ResolveScratch::default();
+        self.resolve_many_cached(root, keys, budget, &mut scratch)
+            .await?;
+        Ok(scratch.best)
+    }
+
+    /// Turn resolved winners into values, fetching every out-of-line winner in ONE batched wave.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    async fn materialize_cached(
+        &self,
+        winners: &[Option<Winner>],
+        budget: &mut BudgetState,
+        scratch: &mut MaterializeScratch,
+    ) -> Result<Vec<Option<Bytes>>, TreeError> {
+        scratch.reset(winners.len());
+        for (slot, w) in winners.iter().enumerate() {
+            match w.as_ref().map(|w| &w.op) {
+                Some(WinnerOp::External { id, len }) => {
+                    // One visit per external REFERENCE, charged before dedup: `WorkBudget` prices the
+                    // work a batch demands, and N keys sharing one value are still N resolutions.
+                    // Matches the scalar `get` path through `load_values`.
+                    budget.visit(1)?;
+                    let ref_slot = *scratch.index.entry(*id).or_insert_with(|| {
+                        let index = scratch.refs.len();
+                        scratch.refs.push((*id, *len));
+                        index
+                    });
+                    scratch.slots[slot] = Some(ref_slot);
+                }
+                Some(_) => {}
+                None => {}
+            }
+        }
+        if scratch.refs.is_empty() {
+            return Ok(winners
+                .iter()
+                .map(|w| {
+                    w.as_ref().and_then(|w| match &w.op {
+                        WinnerOp::Inline(v) => Some(v.clone()),
+                        _ => None,
+                    })
+                })
+                .collect());
+        }
+        self.load_values_deduplicated_cached(budget, scratch)
+            .await?;
+        scratch.out.clear();
+        scratch.out.reserve(winners.len());
+        for (slot, winner) in scratch.slots.iter().copied().zip(winners.iter()) {
+            scratch.out.push(match winner {
+                Some(w) => match &w.op {
+                    WinnerOp::Inline(v) => Some(v.clone()),
+                    WinnerOp::External { .. } => {
+                        let WinnerOp::External { id, len } = &w.op else {
+                            unreachable!()
+                        };
+                        let payload = scratch.cached[slot.expect("recorded")]
+                            .as_ref()
+                            .expect("recorded");
+                        value::validate_reference_len(*id, payload, *len)?;
+                        Some(payload.clone())
+                    }
+                    WinnerOp::Tombstone => None,
+                },
+                None => None,
+            });
+        }
+        Ok(std::mem::take(&mut scratch.out))
+    }
+
+    async fn materialize(
+        &self,
+        winners: Vec<Option<Winner>>,
+        budget: &mut BudgetState,
+    ) -> Result<Vec<Option<Bytes>>, TreeError> {
+        self.materialize_cached(&winners, budget, &mut MaterializeScratch::default())
+            .await
+    }
+
+    /// Every `BlockId` reachable from `node`: child nodes AND out-of-line values, so a GC cannot miss a
+    /// value edge by parsing only child ids.
+    ///
+    /// This is the SUPPORTED graph-walk entry point for consumers: GC mark walks are built on it, and
+    /// a level-at-a-time walk filtered to [`crate::ObjectKind::Node`] derives the shape facts the old
+    /// test harness exposed (node count, leaf depth range) for asserting a workload did not
+    /// degenerate the tree.
+    pub async fn references(
+        &self,
+        node: BlockId,
+    ) -> Result<Vec<(crate::ObjectKind, BlockId)>, TreeError> {
+        Ok(self.view(node).await?.references())
+    }
+
+    /// `references` over a whole frontier in ONE wave, so a GC mark walks a level per round trip.
+    pub async fn references_many(
+        &self,
+        nodes: &[BlockId],
+    ) -> Result<Vec<(crate::ObjectKind, BlockId)>, TreeError> {
+        let mut budget = BudgetState::new(self.budget);
+        // A GC mark walk wants the object graph, not the payloads.
+        let wave = self
+            .load_wave(nodes, AccessHint::MetadataOnly, &mut budget)
+            .await?;
+        Ok(wave.into_values().flat_map(|v| v.references()).collect())
+    }
+
+    // Cursor and scan implementations live in the private scan module.
+}
+
+#[path = "tree_scan.rs"]
+mod scan;
+pub use scan::{DiffCursor, ScanCursor};
+use scan::{KeyRange, RangeSet, bucket_by_prefix, overlaps_scope, prefix_succ};
+
+/// The observable value of a winner: `None` for a tombstone, which is indistinguishable from absent.
+///
+/// Comparing [`WinnerOp`] equality is exactly comparing observable *values*: an out-of-line winner is
+/// equal iff its `(id, length)` is equal, and content addressing makes that equivalent to equal bytes.
+/// The inline threshold is deterministic, so the same bytes never appear both inline and out-of-line.
+fn observable(w: &Winner) -> Option<&WinnerOp> {
+    match &w.op {
+        WinnerOp::Tombstone => None,
+        op => Some(op),
     }
 }
 
-/// Distinct roots in input order (folding one root twice would double-visit its entries).
-fn dedup_roots(roots: &[BlockId]) -> Vec<BlockId> {
-    let mut seen: foldhash::HashSet<BlockId> = Default::default();
-    roots.iter().copied().filter(|r| seen.insert(*r)).collect()
-}
-
-/// A resolved-entry accumulator → the live `(key, value)` pairs in key order (BTreeMap iteration),
-/// tombstones dropped. Shared by `scan_prefix` and `scan_range`.
-fn live_in_order(acc: std::collections::BTreeMap<Vec<u8>, Entry>) -> Vec<(Vec<u8>, Vec<u8>)> {
-    acc.into_iter()
-        .filter_map(|(k, e)| match e.op {
-            MessageOp::Upsert(v) => Some((k, v)),
-            MessageOp::Tombstone => None,
-        })
-        .collect()
+/// [`observable`] over an optional winner: absent and tombstoned are the same observation.
+fn live_value(w: &Option<Winner>) -> Option<&WinnerOp> {
+    w.as_ref().and_then(observable)
 }
