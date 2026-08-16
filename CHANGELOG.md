@@ -12,7 +12,7 @@ recorded here so a consumer's changelog is not the compiler.
   Bε-tree, and `be-tree` was already taken on crates.io by an unrelated 2020 library, so the old name
   was unpublishable. The import path changes from `be_tree::` to `cbe_tree::`. A consumer can keep its
   existing paths with one dependency line:
-  `be-tree = { package = "cbe-tree", path = "../be-tree" }`.
+  `be-tree = { package = "cbe-tree", path = "../cbe-tree" }`.
 
 ### Fixed
 
