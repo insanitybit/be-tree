@@ -424,7 +424,11 @@ pub async fn cow_apply(
     for (i, batch) in batches.drain(..).enumerate() {
         root = fixture
             .tree
-            .apply(root, VersionStamp::from_counter(4_000_000 + i as u64), batch)
+            .apply(
+                root,
+                VersionStamp::from_counter(4_000_000 + i as u64),
+                batch,
+            )
             .await
             .expect("profile COW apply");
         roots.push(root);

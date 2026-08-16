@@ -61,8 +61,8 @@ Generated evidence is under `target/profile/`:
 - `allocations.txt` contains the native allocator counts; and
 - `metadata.txt` records Rust, Valgrind, architecture, cache model, repeats, and a source digest.
 
-Small negative last-level miss deltas can appear when two whole-process profiles are subtracted. They
-mean the operation is beneath setup noise for that event; do not interpret them as a physical effect.
+Small negative cache-miss deltas can appear when two whole-process profiles are subtracted. They mean
+the operation is beneath setup noise for that event; do not interpret them as a physical effect.
 Instruction counts are much more stable. Always pair these profiles with the native Criterion timings:
 neither a cache simulator nor an allocator counter models storage latency, scheduler contention, or the
 actual host's instruction costs.

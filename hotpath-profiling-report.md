@@ -371,40 +371,40 @@ Representative medians (three repeats, shape-matched setup subtraction; full 24-
 
 | Shape | Instructions/op | D1 misses/op | Branch mispredicts/op |
 |---|---:|---:|---:|
-| `get-many-1-sorted-hits` | 6,075 | 22 | 11 |
-| `get-many-16-sorted-hits` | 33,993 | 38 | 215 |
-| `get-many-256-sorted-hits` | 457,169 | 1,390 | 3,255 |
-| `get-many-1024-sorted-hits` | 1,942,474 | 13,518 | 13,008 |
-| `get-many-256-random-mixed` | 380,258 | 2,789 | 3,320 |
-| `get-many-256-sorted-misses` | 172,295 | 1,002 | 798 |
-| `scan-2` | 39,211 | 358 | 300 |
-| `scan-32` | 98,391 | 1,713 | 712 |
-| `scan-256` | 274,671 | 2,914 | 482 |
-| `scan-stream-256` | 254,545 | 3,000 | 303 |
-| `scan-tombstone` | 2,690,734 | 22,061 | 3,669 |
-| `scan-stream-tombstone` | 2,671,242 | 20,470 | 3,736 |
-| `apply-256-distinct` | 5,982,400 | 76,262 | 8,844 |
-| `apply-256-delete` | 5,748,454 | 72,574 | 9,073 |
-| `apply-256-mixed` | 5,727,987 | 73,195 | 10,668 |
-| `apply-1024-distinct` | 17,483,313 | 251,963 | 30,144 |
+| `get-many-1-sorted-hits` | 5,963 | 20 | 9 |
+| `get-many-16-sorted-hits` | 33,406 | 29 | 214 |
+| `get-many-256-sorted-hits` | 457,584 | 1,388 | 3,259 |
+| `get-many-1024-sorted-hits` | 1,942,924 | 13,515 | 13,007 |
+| `get-many-256-random-mixed` | 380,637 | 2,743 | 3,326 |
+| `get-many-256-sorted-misses` | 172,664 | 981 | 803 |
+| `scan-2` | 62,166 | -543 | 346 |
+| `scan-32` | 78,072 | -220 | 589 |
+| `scan-256` | 270,239 | 1,995 | 401 |
+| `scan-stream-256` | 274,792 | 2,899 | 623 |
+| `scan-tombstone` | 2,693,439 | 21,809 | 4,045 |
+| `scan-stream-tombstone` | 2,684,805 | 21,971 | 3,911 |
+| `apply-256-distinct` | 5,985,172 | 76,436 | 8,775 |
+| `apply-256-delete` | 5,742,465 | 72,457 | 8,906 |
+| `apply-256-mixed` | 5,727,342 | 73,089 | 10,665 |
+| `apply-1024-distinct` | 17,475,814 | 251,715 | 30,212 |
 
 Point `get`, with genuinely cold leaf loads (16 distinct strided keys) versus a warmed reread:
 
 | Shape | Instructions/op | D1 misses/op | Branch mispredicts/op |
 |---|---:|---:|---:|
-| `get-cold-short` | 6,110 | 46 | 40 |
-| `get-cold-long` | 9,686 | 488 | 70 |
-| `get-hot-short` | 5,003 | 2 | 18 |
-| `get-hot-long` | 6,759 | 12 | 19 |
+| `get-cold-short` | 4,853 | 7 | 31 |
+| `get-cold-long` | 6,653 | 194 | 59 |
+| `get-hot-short` | 5,410 | 10 | 12 |
+| `get-hot-long` | 6,258 | 3 | 11 |
 
-COW rewrite shapes, per 256-mutation commit: `cow-low` 7,978,298 instructions / 79,946 D1 misses /
-11,125 branch mispredicts; `cow-high` 6,172,605 / 78,441 / 9,277. The overlap axis now
+COW rewrite shapes, per 256-mutation commit: `cow-low` 7,972,614 instructions / 79,925 D1 misses /
+11,139 branch mispredicts; `cow-high` 6,167,056 / 78,324 / 9,221. The overlap axis now
 discriminates. Native storage counters across 25 commits (byte-identical over three repeats):
 
 | Shape | New objects | New bytes | Successive sharing | Final sharing with original | Allocations | Allocated bytes |
 |---|---:|---:|---:|---:|---:|---:|
-| `cow-low` | 148 | 9,699,328 | 0.876974 | 0.000000 | 6,220 | 66,094,366 |
-| `cow-high` | 91 | 5,963,776 | 0.785882 | 0.000000 | 4,148 | 67,517,584 |
+| `cow-low` | 148 | 9,699,328 | 0.876974 | 0.000000 | 6,208 | 66,089,950 |
+| `cow-high` | 91 | 5,963,776 | 0.785882 | 0.000000 | 4,151 | 67,518,688 |
 
 At 25 commit-sized batches over this 17-node fixture every original node is eventually rewritten, so
 final sharing with the original root saturates at zero for both shapes; the discriminating metrics at
@@ -429,11 +429,12 @@ changes, and the matrix confirms no read or write regression beyond run-to-run n
   totals; hotpath attributes bytes and time *per function* with call counts.
   Criterion remains the statistical harness; hotpath answers "where inside".
 
-## Suggested next steps
+## Historical follow-ups (superseded by the 2026-08-14 capture)
 
-1. Chase the 81 KB/batch in `resolve_many` — per-batch scratch reuse; verify with the
-   same `get-many 512` run (the number should drop deterministically).
-2. Give `encode_leaf`/`encode_internal` a reusable output buffer — ~28% of write-path bytes.
-3. Look at `wave`'s 8.9 KB/call on all-hit waves — map/dedup scratch.
-4. Optionally run `--features hotpath,hotpath-cpu` (after `cargo install samply` and
-   granting profiling permissions) to attribute CPU samples inside `resolve_many`.
+The earlier `get-many 512` and single-key COW captures above are retained as provenance, not as
+current decision evidence. Their suggested scratch, encoder, and wave changes were not accepted
+without a matched whole-operation result. The current committed-revision matrix and allocation
+rows are the decision evidence; any further optimization must start with a new frozen baseline.
+
+CPU sampling remains optional and environment-dependent (`samply`/permissions were not part of this
+closeout). The profiles do not validate remote-store latency, request pricing, or concurrency scaling.

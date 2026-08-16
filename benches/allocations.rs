@@ -128,7 +128,11 @@ fn main() {
     // counted region: the region below is rewrite work only, and the sharing/storage counters are
     // collected after counting is disabled.
     let mut cow_batches = is_cow.then(|| {
-        support::cow_batches(fixture.as_ref().unwrap(), scenario == "cow-high", iterations)
+        support::cow_batches(
+            fixture.as_ref().unwrap(),
+            scenario == "cow-high",
+            iterations,
+        )
     });
     let mut cow_roots = is_cow.then(|| Vec::with_capacity(iterations));
     let cow_initial_ids = is_cow.then(|| {

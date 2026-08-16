@@ -64,7 +64,7 @@ fn report_matrix(_c: &mut Criterion) {
 
     println!("\n=== capacity matrix ({KEYS} keys, ~{RECORD}B records, uniform random) ===");
     println!(
-        "{:>8} {:>6} {:>7} {:>7} {:>6} {:>6} {:>7} {:>7} {:>8} {:>9} {:>10} {:>9} {:>8}",
+        "{:>8} {:>6} {:>7} {:>7} {:>6} {:>6} {:>7} {:>7} {:>8} {:>9} {:>10} {:>9} {:>8.1} {:>8}",
         "node",
         "f_max",
         "slots",
@@ -77,6 +77,7 @@ fn report_matrix(_c: &mut Criterion) {
         "min_flush",
         "victim",
         "rd_bytes",
+        "objects",
         "waves"
     );
     for &node_bytes in SIZES {
@@ -107,7 +108,7 @@ fn report_matrix(_c: &mut Criterion) {
             rt.block_on(cold.get_many(root, &probe)).expect("read");
 
             println!(
-                "{:>8} {:>6} {:>7} {:>7} {:>6} {:>6.1} {:>7} {:>7.2} {:>8.3} {:>9} {:>10.0} {:>9.0} {:>8}",
+                "{:>8} {:>6} {:>7} {:>7} {:>6} {:>6.1} {:>7} {:>7.2} {:>8.3} {:>9} {:>10.0} {:>9.0} {:>8.1} {:>8}",
                 node_bytes,
                 f_max,
                 fmt.leaf_slots(),
@@ -120,6 +121,7 @@ fn report_matrix(_c: &mut Criterion) {
                 fmt.min_flush_bytes(),
                 t.metrics().victim_bytes.mean,
                 cold.metrics().bytes_read as f64 / n_probes,
+                cold.metrics().objects_read as f64 / n_probes,
                 cold.metrics().waves,
             );
         }

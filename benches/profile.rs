@@ -125,7 +125,9 @@ fn main() {
                 support::get_many_prepared(&fixture, &queries, iterations).await
             })
         }
-        "scan-tombstone" | "scan-stream-tombstone" | "setup-scan-tombstone"
+        "scan-tombstone"
+        | "scan-stream-tombstone"
+        | "setup-scan-tombstone"
         | "setup-scan-stream-tombstone" => {
             let runtime = support::runtime();
             runtime.block_on(async {

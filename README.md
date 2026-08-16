@@ -107,8 +107,13 @@ content-address boundary, provided reads return the exact bytes named by each `B
 
 [`rfcs/0001-simd-native-node-architecture.md`](rfcs/0001-simd-native-node-architecture.md) is the
 authoritative design, including the selected constants, the benchmark matrix that chose them, and the four
-constant-selection reversals plus the adversarial-review corrections. Node size is target-dependent: the
-RFC gives the checked RTT/bandwidth crossover for the 16 KiB and 64 KiB formats.
+constant-selection reversals plus the adversarial-review corrections. Node size is target- and
+store-dependent: the capacity benchmark reports realized depth, objects touched, bytes read, and
+the assumed cache/transfer model. Its `bytes/lookup` number is a node-transfer model, not a universal
+remote-storage prediction; use `objects/lookup` and the store's actual request and billing units
+when choosing a format. The RFC gives the checked RTT/bandwidth crossover for the 16 KiB and 64 KiB
+formats, but does not establish a universal `F_MAX=16` or 16 KiB choice after the current
+key-reservation rules.
 
 ## Performance evidence
 

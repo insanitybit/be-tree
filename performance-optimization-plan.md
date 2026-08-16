@@ -1,13 +1,20 @@
 # be-tree performance optimization plan
 
-Status: implementation and integration validation complete for the measured plan: accepted Phase 1 read-path experiments, including the direct scalar `get` path, are implemented; Phase 3 encoder-buffer, Phase 4 flush, and leaf-capacity experiments were rejected by whole-operation evidence; the COW shape harness and Stratum consumer gate are complete. Phase 2 representation changes and Phase 6 concurrency changes were not justified by the measured hotspots, and Phase 5's existing value-separation path was validated rather than replaced. A 2026-08-14 review pass repaired the measurement gates (commit-sized COW shapes, genuinely cold point-get rows, tombstone-scan and mixed-apply Cachegrind rows) and a budget-accounting parity defect, and re-captured the full matrix from committed revision `2fc2330`; see the profiling report's matching update.
-Date: 2026-08-13 (measurement gates re-validated 2026-08-14)
+Status: implementation and integration validation complete for the measured plan: accepted Phase 1 read-path experiments, including the direct scalar `get` path, are implemented; Phase 3 encoder-buffer, Phase 4 flush, and leaf-capacity experiments were rejected by whole-operation evidence; the COW shape harness and Stratum consumer gate are complete. Phase 2 representation changes and Phase 6 concurrency changes were not justified by the measured hotspots, and Phase 5's existing value-separation path was validated rather than replaced. A 2026-08-14 review pass repaired the measurement gates (commit-sized COW shapes, genuinely cold point-get rows, tombstone-scan and mixed-apply Cachegrind rows) and a budget-accounting parity defect, and re-captured the full matrix from committed revision `2fc2330`; see the profiling report's matching update. This closes the measured plan, not remote-store or exhaustive-concurrency validation.
+Date: 2026-08-14 (measurement gates re-validated 2026-08-14)
 
 The current implementation retains the existing canonical format and scan merge optimization while
 measuring the next read/write experiments. A three-sample Cachegrind baseline is now captured through
 the repository container; the expanded read, scan-cardinality, apply-shape, and point-get Cachegrind
 matrices are now captured. The Stratum consumer gate has also passed against the local path dependency;
 remote production storage validation remains an environment limitation, not an unrun repository gate.
+
+The remaining limits are explicit: capacity results report both objects touched and bytes under a
+node-transfer model, but do not choose a universal node size or `F_MAX`; the public
+`BeTree::references`/`references_many` methods are the supported graph-walk surface for downstream
+shape and GC checks, while no separate shape-summary API is promised; and the concurrency tests are
+native async stampede checks, not loom-style exhaustive interleaving validation. No remote-store
+latency, billing-unit, or multi-worker throughput claim is made.
 
 ## Objective
 
