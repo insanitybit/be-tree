@@ -14,6 +14,21 @@ recorded here so a consumer's changelog is not the compiler.
   existing paths with one dependency line:
   `be-tree = { package = "cbe-tree", path = "../cbe-tree" }`.
 
+### Added
+
+- **Retention floor restored: `with_retention_floor(VersionStamp)`.** The original
+  `with_floor(store, Hlc)` was deleted undeclared in `e32f036` (see the retroactive Removed section
+  under 0.1.0) and is reinstated in the tree's own vocabulary — an opaque stamp horizon, no clock
+  interpretation. The job changed with the data model: merge now keeps exactly one winner per key, so
+  per-key *history* no longer grows and needs no floor; what still grows without bound is
+  **tombstones**, which must otherwise persist forever to shadow late-arriving lower-stamped writes.
+  With a floor set, a tombstone whose stamp orders below it is physically purged at leaf rewrite.
+  Live winners are never dropped regardless of stamp — a cold key whose only version predates the
+  floor keeps resolving (this is the property the original implementation's comment guarded, now
+  pinned by a test that was verified to fail against the naive `retain(stamp >= floor)`). Caller
+  contract: no future batch may carry a stamp below the floor, or a purged tombstone can no longer
+  defeat it (resurrection). `VersionStamp::ZERO` (default) keeps everything.
+
 ### Fixed
 
 - Work-budget visit accounting is again charged once per external-value **reference** on every read
@@ -66,3 +81,30 @@ downstream as a red build.
 
 - The `explicit-simd` feature and `benches/hashing.rs` — added, measured, rejected, and deleted (see
   the recorded reversals section).
+
+### Removed — undeclared at the time, recorded retroactively (2026-08-16 audit)
+
+The following were removed in the `e32f036` performance refactor with no CHANGELOG entry and no test
+to fail — the silent class: an undeclared removal is invisible in proportion to how untested the
+feature was. Recorded now so the next audit has a baseline.
+
+- **`with_floor(store, Hlc)` / `compact_below_floor`** — the per-key retention floor. Restored in
+  Unreleased as `with_retention_floor(VersionStamp)`, with the test it never had.
+- **Multi-version per-key history ("full time-travel headroom").** Leaves used to retain every
+  version newest-first, resolved LWW-at-read; merge now collapses to exactly one winner per key at
+  every rewrite. No as-of read ever existed publicly, so no observable read changed, but the
+  documented headroom is gone by design. Deliberate and permanent.
+- **`Hlc::join`** — the wall-clock-free confluent successor of two clocks ("a merge is a pure
+  function of its parent commits"). No equivalent exists; `HlcClock::observe` + `next` requires a
+  wall reading. If deterministic merge stamps are needed, that is a new design conversation, not a
+  code restoration.
+- **`NodeStore::put` and `StagedNode`** — the trait was redesigned around pre-addressed batches
+  (`AddressedObject`, `put_batch` returning `()`, byte-bounded `get`/`get_many`). Every external
+  `NodeStore` implementor breaks; the new contract is stronger (the store verifies the caller's
+  hash and enforces read bounds).
+- **Serde derives** on `BlockId`/`Hlc`/message types, and the serde dependency.
+- **Per-message version stamps** — `tree_put` took per-message HLCs; `apply` stamps the whole batch.
+  Re-injecting messages at heterogeneous historical stamps now costs one `apply` per stamp.
+- **`TreeError::Schema` and `TreeError::Codec` variants** — subsumed by `Capacity`, structured
+  `Decode { id, reason: DecodeError }`, and `VersionDomainMismatch`. Downstream exhaustive matches
+  break.

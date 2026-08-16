@@ -686,6 +686,98 @@ async fn visit_budget_prices_scalar_and_batched_reads_identically() {
     );
 }
 
+// ------------------------------------------------------------------ retention floor
+
+/// THE discriminating retention-floor property: a live winner is never dropped, whatever its stamp.
+/// A cold key written once, below the floor, must keep resolving to its value through arbitrarily many
+/// leaf rewrites. A naive `retain(stamp >= floor)` passes every "old versions are dropped" test and
+/// fails exactly this one — losing rarely-updated keys is the bug the floor's contract exists to
+/// prevent.
+#[tokio::test]
+#[cfg_attr(miri, ignore = "native multi-rewrite fixture")]
+async fn a_live_winner_below_the_retention_floor_survives_leaf_rewrites() {
+    let store = Arc::new(MemStore::new());
+    let t = BeTree::with_format(store, Format::tiny())
+        .with_retention_floor(VersionStamp::from_counter(1_000));
+    let empty = t.empty_root().await.unwrap();
+
+    // The cold key: written ONCE, with a stamp far below the floor.
+    let mut root = t.apply(empty, stamp(1), vec![up("cold/key", "survivor")]).await.unwrap();
+
+    // Force repeated flushes and leaf rewrites around it with above-floor traffic.
+    for round in 0..40u64 {
+        let muts: Vec<Mutation> = (0..32u64)
+            .map(|i| up(&format!("hot/{:04}", (round * 32 + i) % 200), "churn"))
+            .collect();
+        root = t.apply(root, stamp(2_000 + round), muts).await.unwrap();
+    }
+
+    assert_eq!(
+        t.get(root, b"cold/key").await.unwrap(),
+        Some(Bytes::from("survivor")),
+        "a cold key whose only version predates the floor must never resolve to absent"
+    );
+    harness::check_balanced(&t, root).await.expect("balanced");
+}
+
+/// The floor's remaining job in the one-winner-per-key design: tombstones below the horizon are
+/// physically purged at leaf rewrite, while every observable read stays identical to a floorless tree
+/// fed the same operations.
+#[tokio::test]
+#[cfg_attr(miri, ignore = "native two-tree comparison fixture")]
+async fn tombstones_below_the_retention_floor_are_purged_and_reads_are_preserved() {
+    let build = |floor: Option<VersionStamp>| {
+        let store = Arc::new(MemStore::new());
+        let t = BeTree::with_format(store, Format::tiny());
+        match floor {
+            Some(f) => t.with_retention_floor(f),
+            None => t,
+        }
+    };
+    let floored = build(Some(VersionStamp::from_counter(1_000)));
+    let plain = build(None);
+
+    let mut roots = Vec::new();
+    for t in [&floored, &plain] {
+        let mut root = t.empty_root().await.unwrap();
+        // 200 keys live, then 150 of them tombstoned below the floor.
+        let ups: Vec<Mutation> = (0..200u32).map(|i| up(&format!("k{i:04}"), "v")).collect();
+        root = t.apply(root, stamp(1), ups).await.unwrap();
+        let dels: Vec<Mutation> = (0..150u32)
+            .map(|i| Mutation::tombstone(Bytes::from(format!("k{i:04}"))))
+            .collect();
+        root = t.apply(root, stamp(2), dels).await.unwrap();
+        // Above-floor churn touching the whole range, so every leaf is rewritten post-floor.
+        for round in 0..10u64 {
+            let muts: Vec<Mutation> = (150..200u32)
+                .map(|i| up(&format!("k{i:04}"), &format!("v{round}")))
+                .collect();
+            root = t.apply(root, stamp(2_000 + round), muts).await.unwrap();
+        }
+        roots.push(root);
+    }
+
+    // Observable equivalence: deleted keys absent, live keys equal, on both trees.
+    for i in 0..200u32 {
+        let key = format!("k{i:04}");
+        let a = floored.get(roots[0], key.as_bytes()).await.unwrap();
+        let b = plain.get(roots[1], key.as_bytes()).await.unwrap();
+        assert_eq!(a, b, "floor must not change any observable read ({key})");
+        assert_eq!(a.is_none(), i < 150, "tombstoned iff below 150 ({key})");
+    }
+
+    // Physical purge: the floored tree carries fewer persisted leaf entries, because the 150
+    // below-floor tombstones were dropped wherever a leaf was rewritten.
+    let shape_floored = harness::check(&floored, roots[0]).await.unwrap();
+    let shape_plain = harness::check(&plain, roots[1]).await.unwrap();
+    assert!(
+        shape_floored.leaf_entries < shape_plain.leaf_entries,
+        "purge must reclaim leaf entries: floored {} !< plain {}",
+        shape_floored.leaf_entries,
+        shape_plain.leaf_entries
+    );
+}
+
 /// A tree taller than `max_tree_level` cannot be built: the attempt fails and publishes nothing.
 #[tokio::test]
 #[cfg_attr(miri, ignore = "native maximum-depth root-growth fixture")]
