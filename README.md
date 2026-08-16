@@ -8,19 +8,20 @@ the leaf with the messages found along the root-to-leaf path.
 use be_tree::{BeTree, MemStore, Mutation, VersionStamp};
 use std::sync::Arc;
 
-# async fn ex() -> Result<(), be_tree::TreeError> {
-let tree = BeTree::new(Arc::new(MemStore::new()));
-let empty = tree.empty_root().await?;
+async fn ex() -> Result<(), be_tree::TreeError> {
+    let tree = MemTree::new(Arc::new(MemStore::new()));
+    let empty = tree.empty_root().await?;
+    
+    let root = tree.tree_put(empty, vec![
+        BTreeMessage::upsert(b"key".to_vec(), b"value".to_vec(), Hlc { wall_ms: 1, logical: 0 }),
+    ]).await?;
+    
+    assert_eq!(tree.tree_get(root, b"key").await?, Some(b"value".to_vec()));
+    // `empty` is still a valid snapshot — writes never mutate.
+    assert_eq!(tree.tree_get(empty, b"key").await?, None);
+    Ok(())
+}
 
-// Every mutation in one batch shares one stamp. Repeated keys collapse to the last in program order.
-let root = tree
-    .apply(empty, VersionStamp::from_counter(1), vec![Mutation::upsert("key", "value")])
-    .await?;
-
-assert_eq!(tree.get(root, b"key").await?.as_deref(), Some(&b"value"[..]));
-// `empty` is still a valid snapshot — writes never mutate.
-assert_eq!(tree.get(empty, b"key").await?, None);
-# Ok(()) }
 ```
 
 ## Why these three properties compound
